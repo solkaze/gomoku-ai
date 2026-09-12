@@ -1,0 +1,14 @@
+[package]
+name = "gomoku-ai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ndarray = "0.17.2"
+ort = "2.0.0-rc.13"
+tch = "0.26.0"
+
+[[bin]]
+name = "gomoku"
+path = "src/run/main.rs"
+
