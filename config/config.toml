@@ -1,0 +1,81 @@
+# 学習 (Python) と自己対局・対戦 (Rust) の共通設定。
+# 相対パスはプロジェクトルートからのパス。
+
+[paths]
+# 自己対局データ (*.npz)。Rust が書き出し、Python が読む。
+selfplay_dir = "runs/selfplay"
+checkpoint_dir = "runs/checkpoints"
+# ONNX モデル。latest.onnx を自己対局・対戦で使う。
+model_dir = "runs/models"
+log_dir = "runs/logs"
+
+[model]
+channels = 128
+blocks = 10
+
+[train]
+device = "cuda"
+batch_size = 512
+# 新しい局面 1 つあたり何サンプル分学習するか (1 回の学習ステップ数 = 新局面数 × これ / batch_size)。
+# 各局面がリプレイバッファにいる間に平均何回使われるかに相当する。大きすぎると過学習する。
+samples_per_position = 4
+# リプレイバッファの局面数がこれに達するまでは自己対局だけ行う
+min_replay = 50_000
+# 学習率のスケジュール: [累計ステップ数, 学習率] のリスト。そのステップ以降はその学習率を使う
+lr_schedule = [[0, 1e-3], [200_000, 3e-4], [600_000, 1e-4]]
+weight_decay = 1e-4
+# 学習に使う直近の局面数
+replay_window = 500_000
+value_loss_weight = 1.0
+# CUDA では bfloat16 の自動混合精度を使う
+amp = true
+# ONNX を float16 で書き出す (推論が約 1.5 倍速くなる。入出力は float32 のまま)
+export_fp16 = true
+
+[loop]
+# `cargo build --release` で作るバイナリ
+selfplay_bin = "target/release/selfplay"
+evaluate_bin = "target/release/evaluate"
+# このファイルを置くと、学習ループは今の段階が終わったところで停止する (停止時に削除される)
+stop_file = "runs/STOP"
+# 残すチェックポイントと ONNX: 直近 keep_last 個と、keep_every イテレーションごとのもの
+keep_last = 3
+keep_every = 50
+
+[selfplay]
+# 1 回の実行で打つ局数
+games = 500
+# 同時に進める対局数 (スレッド数)
+workers = 128
+simulations = 400
+# 1 対局の探索が一度に評価へ出す葉の数
+mcts_batch_size = 8
+c_puct = 1.5
+fpu_reduction = 0.2
+dirichlet_alpha = 0.03
+dirichlet_epsilon = 0.25
+# この手数までは訪問回数に比例して手を選ぶ (序盤の多様性のため)
+temperature_moves = 10
+# 1 ファイルにまとめる局数
+games_per_file = 100
+
+[inference]
+# "cuda" または "cpu"
+device = "cuda"
+# GPU に一度に渡す最大局面数
+max_batch = 256
+# 推論スレッド数。2 以上にするとバッチの収集と GPU 推論が並行する
+threads = 2
+# CUDA 13 / cuDNN 9 のライブラリの場所 (venv の torch に同梱のものを使う)
+cuda_lib_dirs = [
+    ".venv/lib/python3.14/site-packages/nvidia/cu13/lib",
+    ".venv/lib/python3.14/site-packages/nvidia/cudnn/lib",
+]
+
+[evaluate]
+# 何イテレーションごとに、前回の評価時点のモデルと対戦させるか
+interval = 10
+games = 200
+simulations = 200
+# この手数までは訪問回数に比例して手を選ぶ (毎局同じ棋譜になるのを防ぐ)
+temperature_moves = 6

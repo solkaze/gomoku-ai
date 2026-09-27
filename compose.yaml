@@ -1,0 +1,42 @@
+# 学習サーバー用。GPU には NVIDIA Container Toolkit が必要。
+#
+#   mkdir -p runs                         # 先に作っておく (ないと Docker が root 所有で作ってしまう)
+#   docker compose up -d --build train    # 学習ループを開始 (中断・再起動しても続きから)
+#   docker compose logs -f train          # 進捗を見る
+#   touch runs/STOP                       # 今の段階が終わったところで停止する
+#   docker compose up -d tensorboard      # http://<サーバー>:6006 で学習曲線と Elo を見る
+#
+# runs/ に書き出すファイルがホストのユーザーの所有になるよう、そのユーザーで動かす。
+# UID/GID が 1000 でない場合は、同じディレクトリの .env に `UID=...` と `GID=...` を書く (`id -u`, `id -g` で確認)。
+services:
+  train:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: train
+    image: gomoku-ai-train
+    user: "${UID:-1000}:${GID:-1000}"
+    init: true
+    # 異常終了したときだけ再起動する (runs/STOP による正常停止では再起動しない)
+    restart: on-failure
+    volumes:
+      - ./runs:/workspace/runs
+      - ./config:/workspace/config:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  tensorboard:
+    image: gomoku-ai-train
+    user: "${UID:-1000}:${GID:-1000}"
+    command: ["uv", "run", "--no-sync", "tensorboard", "--logdir", "runs/logs", "--host", "0.0.0.0"]
+    ports:
+      - "6006:6006"
+    volumes:
+      - ./runs:/workspace/runs:ro
+    depends_on:
+      - train

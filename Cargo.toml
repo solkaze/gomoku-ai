@@ -4,11 +4,28 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ndarray = "0.17.2"
-ort = "2.0.0-rc.13"
-tch = "0.26.0"
+ort = { version = "2.0.0-rc.13", features = ["cuda", "preload-dylibs"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+rand = "0.9"
+rand_distr = "0.5"
+
+[lib]
+name = "gomoku_engine"
+path = "src/engine/lib.rs"
 
 [[bin]]
 name = "gomoku"
 path = "src/run/main.rs"
 
+[[bin]]
+name = "selfplay"
+path = "src/selfplay/main.rs"
+
+[[bin]]
+name = "evaluate"
+path = "src/evaluate/main.rs"

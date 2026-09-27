@@ -1,0 +1,9 @@
+{
+    "name": "gomoku-ai",
+    "build": {
+        "dockerfile": "../docker/Dockerfile",
+        "context": "..",
+        "target": "base"
+    },
+    "runArgs": ["--gpus", "all"]
+}
