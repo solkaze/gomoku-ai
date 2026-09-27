@@ -61,7 +61,15 @@ impl OnnxModel {
                 .map_err(|e| anyhow::anyhow!("CUDA を有効にできません: {e}"))?;
         }
         let session = builder.commit_from_file(path).with_context(|| format!("{} を読み込めません", path.display()))?;
-        Ok(Self { session })
+        let mut model = Self { session };
+        // GPU で実際に動くかは推論してみるまで分からない (例: GPU の世代向けのカーネルがない) ので、ここで一度試す
+        model.run(&[0; FEATURE_LEN]).with_context(|| {
+            format!(
+                "{device:?} での試し推論に失敗しました。onnxruntime の CUDA 版がこの GPU の世代 \
+                 (compute capability) に対応していない可能性があります"
+            )
+        })?;
+        Ok(model)
     }
 
     /// features は n 局面分の特徴平面 (n * FEATURE_LEN)。
@@ -188,7 +196,14 @@ fn serve(
             }
         }
         let features: Vec<u8> = requests.iter().flat_map(|r| r.features.iter().copied()).collect();
-        let mut evals = model.run(&features)?.into_iter();
+        let mut evals = match model.run(&features) {
+            Ok(evals) => evals.into_iter(),
+            Err(e) => {
+                // 各探索スレッドが待ったまま巻き添えでパニックしないよう、原因を出してプロセスごと終了する
+                eprintln!("推論に失敗しました: {e:#}");
+                std::process::exit(1);
+            }
+        };
         evaluated.fetch_add(evals.len() as u64, Ordering::Relaxed);
         for req in requests {
             let n = req.features.len() / FEATURE_LEN;
