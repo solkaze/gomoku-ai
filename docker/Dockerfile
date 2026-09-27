@@ -46,7 +46,11 @@ RUN cargo build --release --locked \
 
 COPY config ./config
 
-# 学習の成果物 (runs/) はボリュームに置く。root 以外のユーザーで動かすときの書き込み先
+# 学習の成果物 (runs/) はボリュームに置く。
+# compose ではホストの UID で動かすが、その UID はイメージの /etc/passwd にないので、
+# ユーザー名 (torch がキャッシュの場所を決めるのに使う) と書き込み先を環境変数で与える
 ENV HOME=/tmp \
+    USER=gomoku \
+    LOGNAME=gomoku \
     UV_CACHE_DIR=/tmp/uv-cache
 CMD ["uv", "run", "--no-sync", "src/train/main.py", "loop"]
