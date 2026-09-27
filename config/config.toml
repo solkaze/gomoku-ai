@@ -66,6 +66,8 @@ device = "cuda"
 max_batch = 256
 # 推論スレッド数。2 以上にするとバッチの収集と GPU 推論が並行する
 threads = 2
+# onnxruntime の共有ライブラリの場所 (venv の onnxruntime-gpu のものを使う)
+onnxruntime_dir = ".venv/lib/python3.14/site-packages/onnxruntime/capi"
 # CUDA 13 / cuDNN 9 のライブラリの場所 (venv の torch に同梱のものを使う)
 cuda_lib_dirs = [
     ".venv/lib/python3.14/site-packages/nvidia/cu13/lib",

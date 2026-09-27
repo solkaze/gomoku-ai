@@ -7,14 +7,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Locale environment variables
 ENV LANG=C.UTF-8
 
-# libssl-dev と pkg-config は ort がビルド時に onnxruntime をダウンロードするのに使う
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
     git \
-    libssl-dev \
-    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust (rust-toolchain.toml と同じバージョン)
@@ -40,9 +37,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
-RUN cargo build --release --locked \
-    # onnxruntime の共有ライブラリは /root/.cache へのシンボリックリンクなので、root 以外でも読めるよう実体に置き換える
-    && for f in target/release/libonnxruntime*.so; do cp --remove-destination "$(readlink -f "$f")" "$f"; done
+RUN cargo build --release --locked
 
 COPY config ./config
 

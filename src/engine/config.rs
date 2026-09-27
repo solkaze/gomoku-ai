@@ -68,6 +68,8 @@ pub struct InferenceConfig {
     pub max_batch: usize,
     /// 推論スレッド数 (それぞれがモデルを読み込む)
     pub threads: usize,
+    /// libonnxruntime.so のあるディレクトリ
+    pub onnxruntime_dir: PathBuf,
     #[serde(default)]
     pub cuda_lib_dirs: Vec<PathBuf>,
 }
@@ -93,6 +95,7 @@ impl Config {
         let resolve = |p: &mut PathBuf| *p = root.join(&*p);
         resolve(&mut config.paths.selfplay_dir);
         resolve(&mut config.paths.model_dir);
+        resolve(&mut config.inference.onnxruntime_dir);
         config.inference.cuda_lib_dirs.iter_mut().for_each(resolve);
         Ok(config)
     }

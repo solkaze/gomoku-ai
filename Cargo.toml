@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ort = { version = "2.0.0-rc.13", features = ["cuda", "preload-dylibs"] }
+# onnxruntime 本体は venv の onnxruntime-gpu (公式ビルド、RTX 50 系の sm_120 対応) を実行時に読み込む
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "cuda", "api-27"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

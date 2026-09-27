@@ -41,8 +41,9 @@ UID/GID が 1000 でなければ `.env` に `UID=...` / `GID=...` を書く。
 事前に `docker run --rm --gpus all ubuntu nvidia-smi` で GPU が見えるか確認しておく (NVIDIA Container Toolkit が必要)。
 
 イメージには `uv.lock` / `Cargo.lock` / `rust-toolchain.toml` どおりの依存とビルド済みバイナリが入る。
-CUDA / cuDNN は torch の wheel に同梱のもの (`.venv` 内) を Rust 側でも使うので、ホストに CUDA Toolkit は不要。
-ビルド時に crates.io・PyPI・onnxruntime のバイナリ (cdn.pyke.io) へのネットワーク接続が必要。
+CUDA / cuDNN は torch の wheel に同梱のもの、onnxruntime は onnxruntime-gpu の公式 wheel (`.venv` 内) を
+Rust 側でも実行時に読み込むので、ホストに CUDA Toolkit は不要 (RTX 50 系を含む sm_75〜sm_120 に対応)。
+ビルド時に crates.io・PyPI へのネットワーク接続が必要。
 
 ## 主な設定 (`config/config.toml`)
 

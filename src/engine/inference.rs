@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -35,9 +35,35 @@ const CUDA_DYLIBS: &[&str] = &[
     "libcudnn_engines_runtime_compiled.so.9",
 ];
 
+/// onnxruntime を読み込み、CUDA を使う場合はその依存ライブラリも先に読み込む。
+/// 推論 (OnnxModel::load) の前に 1 度呼ぶ。2 回目以降は何もしない。
+pub fn init_runtime(config: &InferenceConfig) -> anyhow::Result<()> {
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            if config.device == Device::Cuda {
+                preload_cuda(&config.cuda_lib_dirs).map_err(|e| format!("{e:#}"))?;
+            }
+            let lib = find_onnxruntime(&config.onnxruntime_dir).map_err(|e| format!("{e:#}"))?;
+            ort::init_from(&lib).map_err(|e| format!("{} を読み込めません: {e}", lib.display()))?.commit();
+            Ok(())
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
+/// dir の中の libonnxruntime.so.<バージョン> を探す。
+fn find_onnxruntime(dir: &Path) -> anyhow::Result<PathBuf> {
+    let entries = std::fs::read_dir(dir).with_context(|| format!("{} がありません (uv sync を実行してください)", dir.display()))?;
+    entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("libonnxruntime.so")))
+        .with_context(|| format!("{} に libonnxruntime.so がありません", dir.display()))
+}
+
 /// lib_dirs にある CUDA / cuDNN を先に読み込む (Python の venv 同梱のものを使うため)。
 /// 見つからないライブラリはシステムの検索パスに任せる。
-pub fn preload_cuda(lib_dirs: &[PathBuf]) -> anyhow::Result<()> {
+fn preload_cuda(lib_dirs: &[PathBuf]) -> anyhow::Result<()> {
     for name in CUDA_DYLIBS {
         if let Some(path) = lib_dirs.iter().map(|d| d.join(name)).find(|p| p.exists()) {
             ort::util::preload_dylib(&path).with_context(|| format!("{} を読み込めません", path.display()))?;
@@ -139,12 +165,7 @@ impl InferenceServer {
 
     /// 設定に従ってモデルを inference.threads 個読み込んで起動する。
     pub fn load(path: &Path, config: &InferenceConfig) -> anyhow::Result<Self> {
-        static PRELOAD: std::sync::Once = std::sync::Once::new();
-        if config.device == Device::Cuda {
-            let mut result = Ok(());
-            PRELOAD.call_once(|| result = preload_cuda(&config.cuda_lib_dirs));
-            result?;
-        }
+        init_runtime(config)?;
         let models = (0..config.threads)
             .map(|_| OnnxModel::load(path, config.device))
             .collect::<anyhow::Result<Vec<_>>>()?;
