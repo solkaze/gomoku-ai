@@ -1,4 +1,4 @@
-//! 2 つのモデルを対戦させて強さを比べる。先後は 1 局ごとに入れ替える。
+//! 2 つのモデルを対戦させて強さを比べる。先後は 1 局ごとに入れ替え、同じ開局を先後それぞれで 1 局ずつ打つ。
 //!
 //!     cargo run --release --bin evaluate -- --model new.onnx --opponent old.onnx [--games N] [--summary out.json]
 
@@ -12,7 +12,7 @@ use anyhow::bail;
 use clap::Parser;
 use gomoku_engine::config::Config;
 use gomoku_engine::inference::InferenceServer;
-use gomoku_engine::selfplay::play_match;
+use gomoku_engine::selfplay::{play_match, random_opening};
 use gomoku_engine::{GameResult, Mcts, Stone};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -86,6 +86,9 @@ fn main() -> anyhow::Result<()> {
     let games = args.games.unwrap_or(config.evaluate.games);
     let mcts_config = config.evaluate.mcts(&config.selfplay);
     let temperature_moves = config.evaluate.temperature_moves;
+    let opening_moves = config.evaluate.opening_moves;
+    // 開局は対局番号から決める (2 局 1 組で同じ開局になるように)
+    let opening_seed: u64 = rand::random();
 
     let model = InferenceServer::load(&args.model, &config.inference)?;
     let opponent = InferenceServer::load(&args.opponent, &config.inference)?;
@@ -106,11 +109,15 @@ fn main() -> anyhow::Result<()> {
                     if game >= games {
                         break;
                     }
-                    let (color, result) = if game % 2 == 0 {
-                        (Stone::Black, play_match(&mut mcts, &mut model, &mut opponent, temperature_moves, &mut rng))
+                    let pair = (game / 2) as u64;
+                    let opening =
+                        random_opening(opening_moves, &mut StdRng::seed_from_u64(opening_seed.wrapping_add(pair)));
+                    let (color, black, white) = if game % 2 == 0 {
+                        (Stone::Black, &mut model, &mut opponent)
                     } else {
-                        (Stone::White, play_match(&mut mcts, &mut opponent, &mut model, temperature_moves, &mut rng))
+                        (Stone::White, &mut opponent, &mut model)
                     };
+                    let result = play_match(&mut mcts, black, white, &opening, temperature_moves, &mut rng);
                     if tx.send((color, result)).is_err() {
                         break;
                     }

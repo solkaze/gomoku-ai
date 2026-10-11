@@ -4,8 +4,8 @@ use rand::rngs::StdRng;
 use super::board;
 use crate::features::{FEATURE_LEN, encode};
 use crate::npz::{NpyArray, NpyData, write_npz};
-use crate::selfplay::play_game;
-use crate::{CELLS, GameResult, Mcts, MctsConfig, Stone, UniformEvaluator, pos};
+use crate::selfplay::{play_game, random_opening};
+use crate::{Board, CELLS, CENTER, GameResult, Mcts, MctsConfig, Stone, UniformEvaluator, pos};
 
 fn plane(features: &[u8], i: usize) -> &[u8] {
     &features[i * CELLS..(i + 1) * CELLS]
@@ -36,7 +36,7 @@ fn features_are_relative_to_side_to_move() {
 fn self_play_game_labels_values_from_side_to_move() {
     let mut rng = StdRng::seed_from_u64(0);
     let mut mcts = Mcts::new(MctsConfig { simulations: 32, dirichlet_epsilon: 0.25, ..Default::default() });
-    let game = play_game(&mut mcts, &mut UniformEvaluator, 10, &mut rng);
+    let game = play_game(&mut mcts, &mut UniformEvaluator, &Board::new(), 10, &mut rng);
 
     assert_ne!(game.result, GameResult::Ongoing);
     // 初手は記録しない
@@ -90,9 +90,53 @@ fn match_uses_each_sides_evaluator() {
         &mut mcts,
         &mut Counting(&black_calls),
         &mut Counting(&white_calls),
+        &Board::new(),
         4,
         &mut rng,
     );
     assert_ne!(result, GameResult::Ongoing);
     assert!(black_calls.get() > 0 && white_calls.get() > 0);
+}
+
+#[test]
+fn random_opening_plays_up_to_max_moves_near_the_stones() {
+    let mut rng = StdRng::seed_from_u64(0);
+    assert_eq!(random_opening(0, &mut rng).move_count(), 0);
+
+    let mut seen = [false; 5];
+    for _ in 0..200 {
+        let b = random_opening(4, &mut rng);
+        assert_eq!(b.result(), GameResult::Ongoing);
+        // 0 手なら初期局面、それ以外は天元 + ランダムな手
+        let random_moves = b.move_count().saturating_sub(1);
+        assert!(random_moves <= 4 && b.move_count() != 1);
+        seen[random_moves] = true;
+        if b.move_count() > 0 {
+            assert_eq!(b.get(CENTER), Some(Stone::Black));
+            let expected = if b.move_count() % 2 == 0 { Stone::Black } else { Stone::White };
+            assert_eq!(b.side_to_move(), expected);
+        }
+        // どの石も他の石から 2 路以内にある
+        let stones: Vec<usize> = (0..CELLS).filter(|&p| b.get(p).is_some()).collect();
+        for &p in &stones {
+            let near = |&q: &usize| q != p && (p / 15).abs_diff(q / 15) <= 2 && (p % 15).abs_diff(q % 15) <= 2;
+            assert!(stones.len() < 2 || stones.iter().any(near));
+        }
+    }
+    assert!(seen.iter().all(|&s| s));
+}
+
+#[test]
+fn self_play_from_an_opening_records_only_searched_positions() {
+    let mut rng = StdRng::seed_from_u64(1);
+    let mut mcts = Mcts::new(MctsConfig { simulations: 32, ..Default::default() });
+    let opening = board(&[(7, 7), (8, 8)], &[(6, 7)], Stone::White);
+    let game = play_game(&mut mcts, &mut UniformEvaluator, &opening, 4, &mut rng);
+
+    assert_eq!(game.samples.len(), game.moves - 3);
+    // 最初の記録は開局直後の白番の局面
+    let first = &game.samples[0].features;
+    assert!(plane(first, 2).iter().all(|&x| x == 0));
+    assert_eq!(plane(first, 0)[pos(6, 7)], 1);
+    assert_eq!(plane(first, 1)[pos(7, 7)], 1);
 }

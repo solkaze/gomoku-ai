@@ -51,6 +51,7 @@ class EvaluateConfig:
     games: int
     simulations: int
     temperature_moves: int
+    opening_moves: int
 
 
 @dataclass(frozen=True)

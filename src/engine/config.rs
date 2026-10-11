@@ -32,6 +32,8 @@ pub struct SelfPlayConfig {
     pub dirichlet_alpha: f32,
     pub dirichlet_epsilon: f32,
     pub temperature_moves: usize,
+    /// 開局でランダムに打つ手数の上限 (0 で無効)
+    pub opening_moves: usize,
     pub games_per_file: usize,
 }
 
@@ -53,6 +55,8 @@ pub struct EvaluateConfig {
     pub games: usize,
     pub simulations: u32,
     pub temperature_moves: usize,
+    /// 開局でランダムに打つ手数の上限 (0 で無効)
+    pub opening_moves: usize,
 }
 
 impl EvaluateConfig {

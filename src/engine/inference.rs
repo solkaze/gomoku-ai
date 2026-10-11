@@ -35,15 +35,51 @@ const CUDA_DYLIBS: &[&str] = &[
     "libcudnn_engines_runtime_compiled.so.9",
 ];
 
+/// 起動時の読み込みの段階 (進捗表示用)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadStage {
+    CudaLibs,
+    Runtime,
+    Session,
+    Warmup,
+}
+
+impl LoadStage {
+    /// device で推論するときに通る段階を、通る順に返す。
+    pub fn stages(device: Device) -> &'static [LoadStage] {
+        const ALL: [LoadStage; 4] = [LoadStage::CudaLibs, LoadStage::Runtime, LoadStage::Session, LoadStage::Warmup];
+        match device {
+            Device::Cuda => &ALL,
+            Device::Cpu => &ALL[1..],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LoadStage::CudaLibs => "CUDA / cuDNN ライブラリの読み込み",
+            LoadStage::Runtime => "ONNX Runtime の読み込み",
+            LoadStage::Session => "モデルの読み込み",
+            LoadStage::Warmup => "試し推論",
+        }
+    }
+}
+
 /// onnxruntime を読み込み、CUDA を使う場合はその依存ライブラリも先に読み込む。
 /// 推論 (OnnxModel::load) の前に 1 度呼ぶ。2 回目以降は何もしない。
 pub fn init_runtime(config: &InferenceConfig) -> anyhow::Result<()> {
+    init_runtime_with(config, &mut |_| {})
+}
+
+/// init_runtime と同じだが、各段階に入るたびに on_stage を呼ぶ。
+pub fn init_runtime_with(config: &InferenceConfig, on_stage: &mut dyn FnMut(LoadStage)) -> anyhow::Result<()> {
     static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     RESULT
         .get_or_init(|| {
             if config.device == Device::Cuda {
+                on_stage(LoadStage::CudaLibs);
                 preload_cuda(&config.cuda_lib_dirs).map_err(|e| format!("{e:#}"))?;
             }
+            on_stage(LoadStage::Runtime);
             let lib = find_onnxruntime(&config.onnxruntime_dir).map_err(|e| format!("{e:#}"))?;
             ort::init_from(&lib).map_err(|e| format!("{} を読み込めません: {e}", lib.display()))?.commit();
             Ok(())
@@ -80,6 +116,12 @@ pub struct OnnxModel {
 
 impl OnnxModel {
     pub fn load(path: &Path, device: Device) -> anyhow::Result<Self> {
+        Self::load_with(path, device, &mut |_| {})
+    }
+
+    /// load と同じだが、各段階に入るたびに on_stage を呼ぶ。
+    pub fn load_with(path: &Path, device: Device, on_stage: &mut dyn FnMut(LoadStage)) -> anyhow::Result<Self> {
+        on_stage(LoadStage::Session);
         let mut builder = Session::builder()?;
         if device == Device::Cuda {
             builder = builder
@@ -88,6 +130,7 @@ impl OnnxModel {
         }
         let session = builder.commit_from_file(path).with_context(|| format!("{} を読み込めません", path.display()))?;
         let mut model = Self { session };
+        on_stage(LoadStage::Warmup);
         // GPU で実際に動くかは推論してみるまで分からない (例: GPU の世代向けのカーネルがない) ので、ここで一度試す
         model.run(&[0; FEATURE_LEN]).with_context(|| {
             format!(

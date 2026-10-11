@@ -90,6 +90,21 @@ fn black_cannot_block_on_forbidden_point() {
     assert!(result.visits.iter().all(|&(mv, _)| mv != pos(7, 7)));
 }
 
+#[test]
+fn black_plays_forbidden_point_only_when_nothing_else_is_left() {
+    // 空点は (7,5) だけで、そこは長連。打って負けるしかない
+    let black_stones = [(7, 2), (7, 3), (7, 4), (7, 6), (7, 7)];
+    let white_stones: Vec<(usize, usize)> = (0..15)
+        .flat_map(|r| (0..15).map(move |c| (r, c)))
+        .filter(|&rc| rc != (7, 5) && !black_stones.contains(&rc))
+        .collect();
+    let b = black_to_move(&black_stones, &white_stones);
+    assert!(b.is_forbidden(pos(7, 5)));
+    let result = search(&b, MctsConfig { simulations: 16, ..Default::default() });
+    assert_eq!(result.visits, vec![(pos(7, 5), 16)]);
+    assert!(result.value < -0.9, "value = {}", result.value);
+}
+
 /// cargo test --release --lib search_speed -- --ignored --nocapture
 #[test]
 #[ignore]

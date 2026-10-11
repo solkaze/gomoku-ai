@@ -1,5 +1,5 @@
 use super::{black_to_move, board};
-use crate::{Board, CENTER, GameResult, MoveError, Stone, pos};
+use crate::{Board, CELLS, CENTER, GameResult, MoveError, Stone, pos};
 
 #[test]
 fn first_move_must_be_center() {
@@ -16,7 +16,25 @@ fn double_three_is_forbidden() {
     // 横 (7,5)(7,6)+p と 縦 (5,7)(6,7)+p の活三が 2 つ
     let b = black_to_move(&[(7, 5), (7, 6), (5, 7), (6, 7)], &[]);
     assert!(b.is_forbidden(pos(7, 7)));
-    assert_eq!(b.clone().play(pos(7, 7)), Err(MoveError::Forbidden));
+}
+
+#[test]
+fn playing_forbidden_point_loses_immediately() {
+    let mut b = black_to_move(&[(7, 5), (7, 6), (5, 7), (6, 7)], &[]);
+    assert!(b.is_legal(pos(7, 7)));
+    assert_eq!(b.play(pos(7, 7)), Ok(GameResult::Win(Stone::White)));
+    // 石は置かれ、その場で終局する
+    assert_eq!(b.get(pos(7, 7)), Some(Stone::Black));
+    assert_eq!(b.last_move(), Some(pos(7, 7)));
+    assert!(b.lost_by_forbidden());
+    assert_eq!(b.play(pos(0, 0)), Err(MoveError::GameOver));
+}
+
+#[test]
+fn overline_loses_immediately() {
+    let mut b = black_to_move(&[(7, 2), (7, 3), (7, 4), (7, 6), (7, 7)], &[]);
+    assert_eq!(b.play(pos(7, 5)), Ok(GameResult::Win(Stone::White)));
+    assert!(b.lost_by_forbidden());
 }
 
 #[test]
@@ -77,6 +95,7 @@ fn five_takes_precedence_over_forbidden() {
     );
     assert!(!b.is_forbidden(pos(7, 7)));
     assert_eq!(b.play(pos(7, 7)), Ok(GameResult::Win(Stone::Black)));
+    assert!(!b.lost_by_forbidden());
 }
 
 #[test]
@@ -113,6 +132,7 @@ fn white_has_no_restrictions_and_overline_wins() {
     );
     assert!(b.is_legal(pos(7, 5)));
     assert_eq!(b.play(pos(7, 5)), Ok(GameResult::Win(Stone::White)));
+    assert!(!b.lost_by_forbidden());
     assert_eq!(b.play(pos(1, 1)), Err(MoveError::GameOver));
 }
 
@@ -129,9 +149,9 @@ fn black_exact_five_wins() {
 }
 
 #[test]
-fn legal_moves_exclude_forbidden_points() {
+fn legal_moves_include_forbidden_points() {
     let b = black_to_move(&[(7, 5), (7, 6), (5, 7), (6, 7)], &[]);
     let moves = b.legal_moves();
-    assert!(!moves.contains(&pos(7, 7)));
-    assert_eq!(moves.len(), 225 - 4 - 1);
+    assert!(moves.contains(&pos(7, 7)));
+    assert_eq!(moves.len(), CELLS - 4);
 }

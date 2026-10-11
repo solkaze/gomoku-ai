@@ -3,14 +3,16 @@
 //! 葉ノードを最大 `batch_size` 個まとめて `Evaluator` に渡す。
 //! 同じ葉に探索が集中しないよう、選択中の経路には仮想損失をかける。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use rand::Rng;
 use rand_distr::{Distribution, Gamma};
 
-use crate::board::{Board, CELLS, GameResult};
+use crate::board::{Board, CELLS, GameResult, Stone};
 
 /// ネットワークによる局面評価の結果。
 pub struct Evaluation {
-    /// 各点の方策ロジット (長さ CELLS)。非合法手の値は無視される。
+    /// 各点の方策ロジット (長さ CELLS)。探索の候補にならない手の値は無視される。
     pub policy: Vec<f32>,
     /// 手番側から見た価値 [-1, 1]
     pub value: f32,
@@ -95,7 +97,7 @@ impl Node {
 }
 
 pub struct SearchResult {
-    /// ルートの各合法手と訪問回数
+    /// ルートの各候補手と訪問回数
     pub visits: Vec<(usize, u32)>,
     /// ルートの手番側から見た価値
     pub value: f32,
@@ -139,20 +141,24 @@ impl SearchResult {
 }
 
 /// 探索する手の候補。即勝ちがあればその 1 手、相手の五を止める必要があれば止める手だけに絞る。
+/// 黒の禁じ手は打てば即負けなので、他に打てる点がある限り候補にしない。
 fn candidate_moves(board: &Board) -> Vec<usize> {
     let side = board.side_to_move();
+    let safe = |&p: &usize| side != Stone::Black || !board.is_forbidden(p);
     if board.move_count() > 0 {
         if let Some(&win) = board.winning_moves(side).first() {
             return vec![win];
         }
-        let blocks: Vec<usize> =
-            board.winning_moves(side.opponent()).into_iter().filter(|&p| board.is_legal(p)).collect();
-        // 止める点が禁じ手しかなければ負けは確定なので、通常の合法手から選ばせる
+        let blocks: Vec<usize> = board.winning_moves(side.opponent()).into_iter().filter(safe).collect();
+        // 止める点が禁じ手しかなければ負けは確定なので、禁じ手以外の手から選ばせる
         if !blocks.is_empty() {
             return blocks;
         }
     }
-    board.legal_moves()
+    let legal = board.legal_moves();
+    let moves: Vec<usize> = legal.iter().copied().filter(safe).collect();
+    // 禁じ手しか残っていなければ、それを打って負けるしかない
+    if moves.is_empty() { legal } else { moves }
 }
 
 pub struct Mcts {
@@ -177,6 +183,17 @@ impl Mcts {
         evaluator: &mut E,
         rng: &mut R,
     ) -> SearchResult {
+        self.search_until(root, evaluator, rng, &AtomicBool::new(false))
+    }
+
+    /// search と同じだが、stop が立ったらそこまでの結果で打ち切る。
+    pub fn search_until<E: Evaluator + ?Sized, R: Rng>(
+        &mut self,
+        root: &Board,
+        evaluator: &mut E,
+        rng: &mut R,
+        stop: &AtomicBool,
+    ) -> SearchResult {
         assert_eq!(root.result(), GameResult::Ongoing, "終局した局面は探索できない");
         self.nodes.clear();
         self.nodes.push(Node::new(usize::MAX, 1.0));
@@ -188,7 +205,7 @@ impl Mcts {
         }
 
         let mut done = 0;
-        while done < self.config.simulations {
+        while done < self.config.simulations && !stop.load(Ordering::Relaxed) {
             let want = self.config.batch_size.min((self.config.simulations - done) as usize);
             let mut paths = Vec::with_capacity(want);
             let mut boards = Vec::with_capacity(want);
@@ -248,12 +265,16 @@ impl Mcts {
                 return (path, board);
             }
             id = self.best_child(id);
+            let mover = board.side_to_move();
             board.play(self.nodes[id].mv).expect("子ノードは合法手のみ");
             path.push(id);
             if self.nodes[id].state == NodeState::Unexpanded {
                 match board.result() {
                     GameResult::Ongoing => {}
-                    GameResult::Win(_) => self.nodes[id].state = NodeState::Terminal(1.0),
+                    // 禁じ手を打った場合は、打った側の負けになる
+                    GameResult::Win(winner) => {
+                        self.nodes[id].state = NodeState::Terminal(if winner == mover { 1.0 } else { -1.0 })
+                    }
                     GameResult::Draw => self.nodes[id].state = NodeState::Terminal(0.0),
                 }
             }

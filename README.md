@@ -45,6 +45,28 @@ CUDA / cuDNN は torch の wheel に同梱のもの、onnxruntime は onnxruntim
 Rust 側でも実行時に読み込むので、ホストに CUDA Toolkit は不要 (RTX 50 系を含む sm_75〜sm_120 に対応)。
 ビルド時に crates.io・PyPI へのネットワーク接続が必要。
 
+## AI と対戦する
+
+```sh
+cargo build --release
+./target/release/gomoku                         # runs/models/latest.onnx と対戦。先手・後手は起動後に選ぶ
+./target/release/gomoku --color white           # 尋ねずに人が白 (後手) で始める
+./target/release/gomoku --model runs/models/iter_0300.onnx --simulations 1600
+./target/release/gomoku --cpu                   # GPU を学習に使っているときなど
+./target/release/gomoku --plain                 # 色やカーソルを使わない行単位の表示
+```
+
+起動するとモデルの読み込みの進み具合 (CUDA ライブラリ → ONNX Runtime → モデル → 試し推論) を表示し、終わると先手・後手の選択に移る。
+
+- 盤は色付きで描き、黒石・白石を大きな丸で表す。端末が横 103 x 縦 33 文字以上なら大きい盤、それ未満なら小さい盤 (横 77 x 縦 18 文字以上が必要) になる。
+- 矢印キーかマウスでカーソルを動かし、Enter・Space・クリックで打つ。黒の初手 (天元) は自動で打つ。
+- 黒 (先手) には三三・四四・長連の禁じ手を人・AI のどちらにも適用する。禁じ手の点にも石は置けるが、置いた時点で黒の負けになる。人が黒のときは禁じ手の点に赤い × を表示する。AI は他に打てる点がある限り禁じ手を打たない。
+- 直前の手には赤い印が付き、勝ちが決まった石の並びは金色で示す。
+- AI は手を打つたびに、勝率の見込みと探索の候補手 (訪問回数の割合) を表示する。
+- キー: `u` (待った。自分の直前の手まで戻す)、`h` (ヒント。今の局面での AI の候補手を盤上に青く表示)、`n` (新しい対局)、`q` / `Esc` / `Ctrl-C` (終了)。
+- 終了すると棋譜を表示する。座標は `x y` (x は左から、y は上から、どちらも 0〜14) で、天元は `7 7`。
+- `--plain` を付けるか、入出力が端末でない (パイプなど) 場合は、色を使わず座標を `7 7` のように入力する行単位の表示になる (`X` が黒、`O` が白、`[ ]` が直前の手、`!` が黒の禁じ手 (打つと負け)。コマンドは `undo`、`hint`、`help`、`quit`)。
+
 ## 主な設定 (`config/config.toml`)
 
 | 項目 | 意味 |
@@ -53,6 +75,7 @@ Rust 側でも実行時に読み込むので、ホストに CUDA Toolkit は不�
 | `train.lr_schedule` | 累計ステップ数ごとの学習率 |
 | `train.replay_window` / `min_replay` | 学習に使う直近の局面数 / 学習を始める局面数 |
 | `selfplay.games` / `simulations` | 1 イテレーションの自己対局数 / 1 手あたりの探索回数 |
+| `selfplay.opening_moves` / `evaluate.opening_moves` | 開局でランダムに打つ手数の上限 (0 で無効)。評価では同じ開局を先後入れ替えて打つ |
 | `evaluate.interval` / `games` | 強さを測る間隔 / 対局数 |
 | `loop.keep_last` / `keep_every` | 残すチェックポイント (直近 N 個と N イテレーションごと) |
 | `inference.threads` / `max_batch` | GPU 推論のスレッド数とバッチサイズ |
