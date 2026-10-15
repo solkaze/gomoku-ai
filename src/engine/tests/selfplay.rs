@@ -4,7 +4,7 @@ use rand::rngs::StdRng;
 use super::board;
 use crate::features::{FEATURE_LEN, encode};
 use crate::npz::{NpyArray, NpyData, write_npz};
-use crate::selfplay::{play_game, random_opening};
+use crate::selfplay::{PlayoutCap, play_game, random_opening};
 use crate::{Board, CELLS, CENTER, GameResult, Mcts, MctsConfig, Stone, UniformEvaluator, pos};
 
 fn plane(features: &[u8], i: usize) -> &[u8] {
@@ -36,7 +36,7 @@ fn features_are_relative_to_side_to_move() {
 fn self_play_game_labels_values_from_side_to_move() {
     let mut rng = StdRng::seed_from_u64(0);
     let mut mcts = Mcts::new(MctsConfig { simulations: 32, dirichlet_epsilon: 0.25, ..Default::default() });
-    let game = play_game(&mut mcts, &mut UniformEvaluator, &Board::new(), 10, &mut rng);
+    let game = play_game(&mut mcts, &mut UniformEvaluator, &Board::new(), 10, PlayoutCap::OFF, &mut rng);
 
     assert_ne!(game.result, GameResult::Ongoing);
     // 初手は記録しない
@@ -131,7 +131,7 @@ fn self_play_from_an_opening_records_only_searched_positions() {
     let mut rng = StdRng::seed_from_u64(1);
     let mut mcts = Mcts::new(MctsConfig { simulations: 32, ..Default::default() });
     let opening = board(&[(7, 7), (8, 8)], &[(6, 7)], Stone::White);
-    let game = play_game(&mut mcts, &mut UniformEvaluator, &opening, 4, &mut rng);
+    let game = play_game(&mut mcts, &mut UniformEvaluator, &opening, 4, PlayoutCap::OFF, &mut rng);
 
     assert_eq!(game.samples.len(), game.moves - 3);
     // 最初の記録は開局直後の白番の局面
@@ -139,4 +139,37 @@ fn self_play_from_an_opening_records_only_searched_positions() {
     assert!(plane(first, 2).iter().all(|&x| x == 0));
     assert_eq!(plane(first, 0)[pos(6, 7)], 1);
     assert_eq!(plane(first, 1)[pos(7, 7)], 1);
+}
+
+#[test]
+fn playout_cap_records_only_full_searches() {
+    use std::cell::Cell;
+    struct Counting<'a>(&'a Cell<usize>);
+    impl crate::Evaluator for Counting<'_> {
+        fn evaluate(&mut self, boards: &[crate::Board]) -> Vec<crate::Evaluation> {
+            self.0.set(self.0.get() + boards.len());
+            UniformEvaluator.evaluate(boards)
+        }
+    }
+    let mut rng = StdRng::seed_from_u64(0);
+    let mut mcts = Mcts::new(MctsConfig { simulations: 64, batch_size: 1, dirichlet_epsilon: 0.25, ..Default::default() });
+
+    // 速い探索だけなら学習データは残らず、評価回数は 1 手あたり (ルート 1 回 + 探索回数) 以下になる
+    let calls = Cell::new(0);
+    let cap = PlayoutCap { full_prob: 0.0, fast_simulations: 4 };
+    let game = play_game(&mut mcts, &mut Counting(&calls), &Board::new(), 4, cap, &mut rng);
+    assert_ne!(game.result, GameResult::Ongoing);
+    assert!(game.samples.is_empty());
+    assert!(calls.get() <= game.moves * 5);
+
+    // 半分ほどを通常の探索にすると、その局面だけが記録される
+    let cap = PlayoutCap { full_prob: 0.5, fast_simulations: 4 };
+    let mut recorded = 0;
+    let mut moves = 0;
+    for _ in 0..10 {
+        let game = play_game(&mut mcts, &mut UniformEvaluator, &Board::new(), 4, cap, &mut rng);
+        recorded += game.samples.len();
+        moves += game.moves - 1;
+    }
+    assert!(recorded > 0 && recorded < moves);
 }

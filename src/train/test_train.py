@@ -1,5 +1,7 @@
 """uv run pytest src/train"""
 
+import csv
+import json
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -9,11 +11,13 @@ import onnxruntime as ort
 import pytest
 import torch
 
-from config import DEFAULT_CONFIG, Paths, load_config
+from config import DEFAULT_CONFIG, Config, ModelConfig, Paths, load_config
+from distill import lr_at_step
 from export import export_onnx
 from network import BOARD_SIZE, CELLS, IN_CHANNELS, PolicyValueNet, loss_fn
+from pipeline import ensure_best
 from replay import ReplayBuffer, augment, transform
-from trainer import lr_at, new_positions, prune
+from trainer import adopt, init, load, lr_at, make_optimizer, model_path, new_positions, prune, save
 
 
 def fake_data(n: int, seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -128,26 +132,122 @@ def test_new_positions_counts_only_newer_files(tmp_path: Path) -> None:
     assert new_positions(tmp_path, since=102) == (0, 102)
 
 
-def test_prune_keeps_recent_periodic_and_eval_reference(tmp_path: Path) -> None:
+def test_prune_keeps_recent_and_periodic(tmp_path: Path) -> None:
     config = load_config()
     paths = Paths(tmp_path / "sp", tmp_path / "ckpt", tmp_path / "models", tmp_path / "logs")
-    config = replace(
-        config,
-        paths=paths,
-        loop=replace(config.loop, keep_last=2, keep_every=10),
-        evaluate=replace(config.evaluate, interval=4),
-    )
+    config = replace(config, paths=paths, loop=replace(config.loop, keep_last=2, keep_every=10))
     for d in (paths.checkpoint_dir, paths.model_dir):
         d.mkdir()
         for i in range(24):
             (d / f"iter_{i:04d}{'.pt' if d == paths.checkpoint_dir else '.onnx'}").touch()
         (d / "latest.pt").touch()
+    (paths.model_dir / "best.onnx").touch()
+    (paths.checkpoint_dir / "backup_iter_0005.pt").touch()
     prune(config, latest=23)
     kept = sorted(int(p.stem[5:]) for p in paths.model_dir.glob("iter_*.onnx"))
-    # 10 ごと (0, 10, 20) + 直近 2 個 (22, 23) + 評価の基準 (20 と 1 つ前の 16)
-    assert kept == [0, 10, 16, 20, 22, 23]
+    # 10 ごと (0, 10, 20) + 直近 2 個 (22, 23)
+    assert kept == [0, 10, 20, 22, 23]
     assert sorted(int(p.stem[5:]) for p in paths.checkpoint_dir.glob("iter_*.pt")) == kept
     assert (paths.checkpoint_dir / "latest.pt").exists()
+    assert (paths.model_dir / "best.onnx").exists()
+    assert (paths.checkpoint_dir / "backup_iter_0005.pt").exists()
+
+
+def test_replay_batch_without_augmentation_keeps_order(tmp_path: Path) -> None:
+    states, policy, value = fake_data(10)
+    path = tmp_path / "0.npz"
+    np.savez(path, states=states, policy=policy, value=value)
+    buffer = ReplayBuffer.from_files([path], torch.device("cpu"), policy_dtype=np.float16)
+    assert buffer.policy.dtype == torch.float16
+    s, p, v = buffer.batch(torch.tensor([3, 1]), augmented=False)
+    assert torch.equal(s, torch.from_numpy(states[[3, 1]]).float())
+    assert p.dtype == torch.float32
+    np.testing.assert_allclose(p.numpy(), policy[[3, 1]], atol=1e-3)
+    assert torch.equal(v, torch.from_numpy(value[[3, 1]]))
+
+
+def test_distill_lr_warms_up_and_decays() -> None:
+    steps = 20_000
+    lrs = [lr_at_step(s, steps, 1e-3) for s in range(steps)]
+    assert lrs[0] < lrs[500] < lrs[999] == pytest.approx(1e-3)
+    assert lrs[-1] == pytest.approx(1e-5, rel=1e-2)
+    assert all(a >= b for a, b in zip(lrs[1000:], lrs[1001:]))
+
+
+def small_config(tmp_path: Path) -> Config:
+    config = load_config()
+    paths = Paths(tmp_path / "sp", tmp_path / "ckpt", tmp_path / "models", tmp_path / "logs")
+    for d in (paths.selfplay_dir, paths.model_dir, paths.log_dir):
+        d.mkdir()
+    return replace(
+        config,
+        paths=paths,
+        model=ModelConfig(channels=8, blocks=1),
+        train=replace(config.train, device="cpu", export_fp16=False),
+        gating=replace(config.gating, anchor=paths.model_dir / "anchor.onnx"),
+    )
+
+
+def test_adopt_backs_up_and_continues_iteration(tmp_path: Path) -> None:
+    config = small_config(tmp_path)
+    init(config)
+    state = load(config, torch.device("cpu"))
+    state.iteration = 7
+    save(config, state)
+    np.savez(config.paths.selfplay_dir / "a.npz", value=np.zeros(3, dtype=np.float32))
+
+    other = PolicyValueNet(channels=12, blocks=2)
+    ckpt = tmp_path / "other.pt"
+    torch.save(
+        {
+            "model_config": {"channels": 12, "blocks": 2},
+            "model": other.state_dict(),
+            "optimizer": make_optimizer(other, config).state_dict(),
+        },
+        ckpt,
+    )
+    assert adopt(config, ckpt) == 8
+    assert (config.paths.checkpoint_dir / "backup_iter_0007.pt").exists()
+    adopted = load(config, torch.device("cpu"))
+    assert (adopted.iteration, adopted.step) == (8, 0)
+    assert len(adopted.model.trunk) == 2
+    # 既にある自己対局データは学習済み扱い
+    assert new_positions(config.paths.selfplay_dir, adopted.trained_until)[0] == 0
+    assert (config.paths.model_dir / "iter_0008.onnx").exists()
+
+
+def fake_evaluate(tmp_path: Path, score: float) -> Path:
+    """--summary に決まった勝率を書き出し、引数を記録するだけの evaluate の代わり。"""
+    script = tmp_path / f"evaluate_{score}"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> {tmp_path}/calls\n'
+        'while [ $# -gt 0 ]; do [ "$1" = --summary ] && out=$2; shift; done\n'
+        f"echo '{{\"games\": 400, \"wins\": 0, \"losses\": 0, \"draws\": 0, \"score\": {score}, "
+        f"\"elo_diff\": 35.0}}' > $out\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+@pytest.mark.parametrize(("score", "promoted"), [(0.6, True), (0.5, False)])
+def test_gating_promotes_only_above_threshold(tmp_path: Path, score: float, promoted: bool) -> None:
+    config = small_config(tmp_path)
+    config = replace(config, loop=replace(config.loop, evaluate_bin=fake_evaluate(tmp_path, score)))
+    init(config)
+    (config.gating.anchor).write_bytes(b"anchor")
+    ensure_best(config)  # 最強モデルを基準モデルにし、iter 0 と比べる
+
+    best = config.paths.model_dir / "best.onnx"
+    assert best.read_bytes() == (model_path(config, 0).read_bytes() if promoted else b"anchor")
+    state = json.loads((config.paths.log_dir / "best.json").read_text())
+    assert state == ({"iteration": 0, "elo": 35.0} if promoted else {"iteration": None, "elo": 0.0})
+    calls = (tmp_path / "calls").read_text().splitlines()
+    # ゲーティング 1 回 + 置き換えたときだけ基準モデルとの対戦
+    assert len(calls) == (2 if promoted else 1)
+    assert "--games 400" in calls[0]
+    with open(config.paths.log_dir / "gating.csv") as f:
+        assert [r["promoted"] for r in csv.DictReader(f)] == [str(int(promoted))]
 
 
 def test_relative_paths_are_resolved_from_project_root(tmp_path: Path) -> None:

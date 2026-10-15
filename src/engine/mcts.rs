@@ -194,19 +194,45 @@ impl Mcts {
         rng: &mut R,
         stop: &AtomicBool,
     ) -> SearchResult {
+        let (simulations, root_noise) = (self.config.simulations, self.config.dirichlet_epsilon > 0.0);
+        self.run(root, evaluator, rng, stop, simulations, root_noise)
+    }
+
+    /// 探索回数とルートノイズの有無だけを変えて探索する (playout cap randomization の速い探索用)。
+    pub fn search_with<E: Evaluator + ?Sized, R: Rng>(
+        &mut self,
+        root: &Board,
+        evaluator: &mut E,
+        rng: &mut R,
+        simulations: u32,
+        root_noise: bool,
+    ) -> SearchResult {
+        let root_noise = root_noise && self.config.dirichlet_epsilon > 0.0;
+        self.run(root, evaluator, rng, &AtomicBool::new(false), simulations, root_noise)
+    }
+
+    fn run<E: Evaluator + ?Sized, R: Rng>(
+        &mut self,
+        root: &Board,
+        evaluator: &mut E,
+        rng: &mut R,
+        stop: &AtomicBool,
+        simulations: u32,
+        root_noise: bool,
+    ) -> SearchResult {
         assert_eq!(root.result(), GameResult::Ongoing, "終局した局面は探索できない");
         self.nodes.clear();
         self.nodes.push(Node::new(usize::MAX, 1.0));
 
         let eval = evaluator.evaluate(std::slice::from_ref(root)).pop().expect("評価結果がない");
         self.expand(ROOT, root, &eval.policy);
-        if self.config.dirichlet_epsilon > 0.0 {
+        if root_noise {
             self.add_root_noise(rng);
         }
 
         let mut done = 0;
-        while done < self.config.simulations && !stop.load(Ordering::Relaxed) {
-            let want = self.config.batch_size.min((self.config.simulations - done) as usize);
+        while done < simulations && !stop.load(Ordering::Relaxed) {
+            let want = self.config.batch_size.min((simulations - done) as usize);
             let mut paths = Vec::with_capacity(want);
             let mut boards = Vec::with_capacity(want);
             for _ in 0..want {

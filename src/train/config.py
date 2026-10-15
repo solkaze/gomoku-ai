@@ -47,11 +47,19 @@ class LoopConfig:
 
 @dataclass(frozen=True)
 class EvaluateConfig:
-    interval: int
     games: int
     simulations: int
     temperature_moves: int
     opening_moves: int
+
+
+@dataclass(frozen=True)
+class GatingConfig:
+    interval: int
+    games: int
+    threshold: float
+    anchor: Path
+    anchor_games: int
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,7 @@ class Config:
     train: TrainConfig
     loop: LoopConfig
     evaluate: EvaluateConfig
+    gating: GatingConfig
 
 
 def find_root(config_path: Path) -> Path:
@@ -83,6 +92,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     loop = dict(raw["loop"])
     for key in ("selfplay_bin", "evaluate_bin", "stop_file"):
         loop[key] = root / loop[key]
+    gating = dict(raw["gating"])
+    gating["anchor"] = root / gating["anchor"]
     return Config(
         path=path.resolve(),
         paths=paths,
@@ -90,4 +101,5 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
         train=TrainConfig(**train),
         loop=LoopConfig(**loop),
         evaluate=EvaluateConfig(**raw["evaluate"]),
+        gating=GatingConfig(**gating),
     )

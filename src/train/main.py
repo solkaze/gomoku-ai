@@ -4,6 +4,10 @@
     uv run src/train/main.py init     # ランダム初期化したモデルを作る
     uv run src/train/main.py train    # 自己対局データで 1 イテレーション学習し、ONNX を書き出す
     uv run src/train/main.py export   # 最新チェックポイントを ONNX に書き出し直す
+    uv run src/train/main.py distill --channels 192 --blocks 15 --out runs/distill/15b192c.pt
+                                      # 今ある自己対局データで新しいネットワークを教師あり学習する
+    uv run src/train/main.py adopt runs/distill/15b192c.pt
+                                      # そのチェックポイントを学習ループの最新モデルにする
 
 ループを止めるときは config の loop.stop_file (既定 runs/STOP) を作る。
 """
@@ -14,9 +18,10 @@ from pathlib import Path
 
 import torch
 
-from config import DEFAULT_CONFIG, load_config
+from config import DEFAULT_CONFIG, ModelConfig, load_config
+from distill import DistillArgs, distill
 from pipeline import run_loop
-from trainer import export_latest, has_checkpoint, init, load, train_iteration
+from trainer import adopt, export_latest, has_checkpoint, init, load, train_iteration
 
 
 def main() -> None:
@@ -31,6 +36,15 @@ def main() -> None:
     init_parser.add_argument("--force", action="store_true", help="既存のチェックポイントを上書きする")
     sub.add_parser("train", help="自己対局データで 1 イテレーション学習する")
     sub.add_parser("export", help="最新チェックポイントを ONNX に書き出す")
+    distill_parser = sub.add_parser("distill", help="今ある自己対局データで新しいネットワークを教師あり学習する")
+    distill_parser.add_argument("--channels", type=int, required=True)
+    distill_parser.add_argument("--blocks", type=int, required=True)
+    distill_parser.add_argument("--positions", type=int, default=5_000_000, help="直近この局面数を使う")
+    distill_parser.add_argument("--epochs", type=float, default=6.0, help="各局面を平均何回学習するか")
+    distill_parser.add_argument("--lr", type=float, default=1e-3, help="学習率の最大値 (cosine で下げる)")
+    distill_parser.add_argument("--out", type=Path, required=True, help="チェックポイントの書き出し先 (.pt)")
+    adopt_parser = sub.add_parser("adopt", help="チェックポイントを学習ループの最新モデルにする")
+    adopt_parser.add_argument("checkpoint", type=Path)
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -46,6 +60,11 @@ def main() -> None:
         case "export":
             state = load(config, torch.device("cpu"))
             print(f"書き出しました: {export_latest(config, state.model, state.iteration)}")
+        case "distill":
+            model = ModelConfig(channels=args.channels, blocks=args.blocks)
+            distill(config, DistillArgs(model, args.positions, args.epochs, args.lr, args.out))
+        case "adopt":
+            print(f"iter {adopt(config, args.checkpoint)} として取り込みました")
 
 
 if __name__ == "__main__":

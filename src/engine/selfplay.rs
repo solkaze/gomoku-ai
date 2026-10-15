@@ -63,22 +63,41 @@ fn opening_candidates(board: &Board) -> Vec<usize> {
     (0..CELLS).filter(|&p| board.is_legal(p) && near(p) && !(black && board.is_forbidden(p))).collect()
 }
 
+/// playout cap randomization (KataGo): 各手を確率 full_prob で通常の探索 (mcts の設定どおり) にし、
+/// それ以外は fast_simulations 回・ノイズなしの速い探索で打つ。学習データにするのは通常の探索をした局面だけ。
+#[derive(Clone, Copy, Debug)]
+pub struct PlayoutCap {
+    pub full_prob: f64,
+    pub fast_simulations: u32,
+}
+
+impl PlayoutCap {
+    /// 全ての手を通常の探索で打つ (無効)。
+    pub const OFF: Self = Self { full_prob: 1.0, fast_simulations: 0 };
+}
+
 /// opening の局面から 1 局打つ。そこから temperature_moves 手は訪問回数に比例して手を選び、以降は最多訪問手を打つ。
-/// 学習データにするのは探索して打った局面だけで、opening までの手は含めない。
+/// 学習データにするのは通常の探索をして打った局面だけで、opening までの手は含めない。
 pub fn play_game<E: Evaluator, R: Rng>(
     mcts: &mut Mcts,
     evaluator: &mut E,
     opening: &Board,
     temperature_moves: usize,
+    cap: PlayoutCap,
     rng: &mut R,
 ) -> Game {
     let mut board = opening.clone();
     let temperature_until = board.move_count() + temperature_moves;
     let mut records: Vec<(Vec<u8>, Vec<f32>, Stone)> = Vec::new();
     while board.result() == GameResult::Ongoing {
-        let result = mcts.search(&board, evaluator, rng);
+        let full = cap.full_prob >= 1.0 || rng.random_bool(cap.full_prob.max(0.0));
+        let result = if full {
+            mcts.search(&board, evaluator, rng)
+        } else {
+            mcts.search_with(&board, evaluator, rng, cap.fast_simulations, false)
+        };
         // 黒の初手は天元で固定なので学習しない
-        if board.move_count() > 0 {
+        if full && board.move_count() > 0 {
             let mut features = vec![0; FEATURE_LEN];
             encode(&board, &mut features);
             records.push((features, result.policy(), board.side_to_move()));

@@ -15,14 +15,33 @@ AlphaZero 方式 (MCTS + 方策・価値ネットワーク) で自己対局か�
 ```sh
 uv sync
 cargo build --release
-uv run src/train/main.py loop           # 自己対局 → 学習 → 評価 を繰り返す
+uv run src/train/main.py loop           # 自己対局 → 学習 → ゲーティング を繰り返す
 ```
 
 - 途中で止まっても、再実行すれば最新のチェックポイントから続ける。
 - `touch runs/STOP` で、今の段階 (自己対局 or 学習) が終わったところで停止する。
 - 進捗は `uv run tensorboard --logdir runs/logs` で見る (損失・学習率・自己対局の勝率・Elo)。
-- 強さの推移は `runs/logs/evaluation.csv` にも記録される。`evaluate.interval` イテレーションごとに、
-  前回の評価時点のモデルと対戦した勝率と、そこから積み上げた累計 Elo。
+- 自己対局には最強モデル `runs/models/best.onnx` だけを使う (ゲーティング)。`gating.interval` イテレーションごとに
+  最新モデルと `gating.games` 局打たせ、勝率が `gating.threshold` 以上なら置き換える。結果は `runs/logs/gating.csv`。
+  学習が一時的に悪くなっても、自己対局に使うモデルは弱くならない。
+- 最強モデルが入れ替わるたびに固定の基準モデル `gating.anchor` と対戦させ、基準からの Elo を
+  `runs/logs/strength.csv` に記録する。強くなっているかはこれで見る。
+- 自己対局は playout cap randomization (KataGo) を使う。`selfplay.full_search_prob` の割合の手だけ
+  `simulations` 回探索して学習データにし、残りは `fast_simulations` 回の速い探索で打つ。
+
+### ネットワークを大きくする
+
+強化学習を最初からやり直さず、今ある自己対局データで大きいネットワークを教師あり学習してから引き継ぐ。
+
+```sh
+uv run src/train/main.py distill --channels 192 --blocks 15 --out runs/distill/15b192c.pt
+uv run src/train/main.py adopt runs/distill/15b192c.pt   # 今のチェックポイントは backup_iter_XXXX.pt に残る
+rm runs/models/best.onnx                                  # 次のループ開始時に基準モデルと比べて選び直させる
+```
+
+`distill` は直近 `--positions` 局面 (既定 500 万) を `--epochs` 周学習し、検証損失を今のモデルと並べて表示する。
+`adopt` 後の最初のループでは、最強モデルを基準モデルに戻したうえで新しいモデルと対戦させ、
+勝ち越したときだけ自己対局に使う。
 
 ### サーバーで回す (Docker)
 
@@ -80,8 +99,11 @@ cargo build --release
 | `train.lr_schedule` | 累計ステップ数ごとの学習率 |
 | `train.replay_window` / `min_replay` | 学習に使う直近の局面数 / 学習を始める局面数 |
 | `selfplay.games` / `simulations` | 1 イテレーションの自己対局数 / 1 手あたりの探索回数 |
+| `selfplay.full_search_prob` / `fast_simulations` | playout cap randomization: 通常の探索をする手の割合 (1.0 で無効) / それ以外の手の探索回数 |
 | `selfplay.opening_moves` / `evaluate.opening_moves` | 開局でランダムに打つ手数の上限 (0 で無効)。評価では同じ開局を先後入れ替えて打つ |
-| `evaluate.interval` / `games` | 強さを測る間隔 / 対局数 |
+| `evaluate.simulations` | 対戦 (ゲーティング・基準モデルとの対戦) での 1 手あたりの探索回数 |
+| `gating.interval` / `games` / `threshold` | 最強モデルと比べる間隔 / 対局数 / 置き換える勝率 |
+| `gating.anchor` / `anchor_games` | 強さの基準にする固定のモデル / それとの対局数 |
 | `loop.keep_last` / `keep_every` | 残すチェックポイント (直近 N 個と N イテレーションごと) |
 | `inference.threads` / `max_batch` | GPU 推論のスレッド数とバッチサイズ |
 

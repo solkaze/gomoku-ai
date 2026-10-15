@@ -26,32 +26,58 @@ class ReplayBuffer:
         return len(self.value)
 
     @classmethod
-    def load(cls, selfplay_dir: Path, window: int, device: torch.device) -> "ReplayBuffer":
-        files = sorted(selfplay_dir.glob("*.npz"), key=lambda p: p.stat().st_mtime, reverse=True)
+    def load(
+        cls, selfplay_dir: Path, window: int, device: torch.device, policy_dtype: type = np.float32
+    ) -> "ReplayBuffer":
+        """直近 window 局面を読む。"""
+        files = newest_files(selfplay_dir, window)
+        if not files:
+            raise FileNotFoundError(f"自己対局データがありません: {selfplay_dir}")
+        return cls.from_files(files, device, window, policy_dtype)
+
+    @classmethod
+    def from_files(
+        cls, files: list[Path], device: torch.device, window: int | None = None, policy_dtype: type = np.float32
+    ) -> "ReplayBuffer":
+        """新しい順に並んだ files を読み、(window があれば) 末尾 window 局面だけ残す。
+        policy_dtype を float16 にすると、大量の局面を読むときのメモリを減らせる。"""
         chunks: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-        total = 0
         for path in files:
             with np.load(path) as data:
                 states, policy, value = data["states"], data["policy"], data["value"]
             _validate(path, states, policy, value)
-            chunks.append((states, policy, value))
-            total += len(value)
-            if total >= window:
-                break
-        if not chunks:
-            raise FileNotFoundError(f"自己対局データがありません: {selfplay_dir}")
-
-        # 新しい順に読んだので古い順に戻し、末尾 window 局面だけ残す
+            chunks.append((states, policy.astype(policy_dtype, copy=False), value))
+        # 新しい順に読んだので古い順に戻す
         chunks.reverse()
-        states, policy, value = (np.concatenate(xs)[-window:] for xs in zip(*chunks))
+        states, policy, value = (np.concatenate(xs)[-window if window else 0 :] for xs in zip(*chunks))
         return cls(states, policy, value, device)
 
     def sample(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         idx = torch.randint(len(self), (batch_size,), device=self.value.device)
+        return self.batch(idx)
+
+    def batch(
+        self, idx: torch.Tensor, augmented: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """idx の局面を学習用のテンソルにする。augmented なら 8 対称の拡張をかける。"""
         states = self.states[idx].float()
-        policy = self.policy[idx].view(-1, 1, BOARD_SIZE, BOARD_SIZE)
-        states, policy = augment(states, policy)
+        policy = self.policy[idx].float()
+        if augmented:
+            states, policy = augment(states, policy.view(-1, 1, BOARD_SIZE, BOARD_SIZE))
         return states, policy.reshape(-1, CELLS), self.value[idx]
+
+
+def newest_files(selfplay_dir: Path, positions: int) -> list[Path]:
+    """自己対局ファイルを新しい順に、合計が positions 局面に達するまで返す。"""
+    files = sorted(selfplay_dir.glob("*.npz"), key=lambda p: p.stat().st_mtime, reverse=True)
+    picked, total = [], 0
+    for path in files:
+        with np.load(path) as data:
+            total += len(data["value"])
+        picked.append(path)
+        if total >= positions:
+            break
+    return picked
 
 
 def augment(states: torch.Tensor, policy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

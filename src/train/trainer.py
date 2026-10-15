@@ -133,6 +133,29 @@ def init(config: Config) -> None:
     save(config, TrainState(model, make_optimizer(model, config), iteration=0, step=0, trained_until=0.0))
 
 
+def adopt(config: Config, path: Path) -> int:
+    """別に学習したチェックポイント (distill の出力など) を学習ループの最新モデルにする。
+    今の最新チェックポイントは backup_iter_XXXX.pt として残す。新しいイテレーション番号を返す。
+
+    学習率スケジュールの累計ステップ数は 0 から数え直し、今ある自己対局データは学習済みとして扱う。"""
+    data = torch.load(path, map_location="cpu", weights_only=True)
+    model = PolicyValueNet.from_config(ModelConfig(**data["model_config"]))
+    model.load_state_dict(data["model"])
+    optimizer = make_optimizer(model, config)
+    optimizer.load_state_dict(data["optimizer"])
+
+    iteration = 0
+    if has_checkpoint(config):
+        iteration = current_iteration(config)
+        backup = config.paths.checkpoint_dir / f"backup_{iter_name(iteration)}.pt"
+        replace_file(config.paths.checkpoint_dir / LATEST_CHECKPOINT, backup)
+        print(f"今のチェックポイントを残しました: {backup}")
+    files = list(config.paths.selfplay_dir.glob("*.npz"))
+    trained_until = max((p.stat().st_mtime for p in files), default=0.0)
+    save(config, TrainState(model, optimizer, iteration + 1, step=0, trained_until=trained_until))
+    return iteration + 1
+
+
 def new_positions(selfplay_dir: Path, since: float) -> tuple[int, float]:
     """更新時刻が since より新しい自己対局ファイルの局面数と、その中で最も新しい更新時刻。"""
     count, newest = 0, since
@@ -202,14 +225,12 @@ def train_iteration(config: Config) -> int | None:
 
 
 def prune(config: Config, latest: int) -> None:
-    """直近 keep_last 個・keep_every ごと・強さの評価に使う基準モデル以外の古いファイルを消す。"""
+    """直近 keep_last 個と keep_every ごと以外の古いファイルを消す。
+    自己対局に使う最強モデルと強さの基準モデルは別名のコピーなので、ここでは消えない。"""
     lc = config.loop
-    interval = config.evaluate.interval
-    last_eval = latest - latest % interval
-    protected = {last_eval, last_eval - interval}
 
     def keep(i: int) -> bool:
-        return i > latest - lc.keep_last or i % lc.keep_every == 0 or i in protected
+        return i > latest - lc.keep_last or i % lc.keep_every == 0
 
     for directory, suffix in ((config.paths.checkpoint_dir, ".pt"), (config.paths.model_dir, ".onnx")):
         for path in directory.glob(f"iter_*{suffix}"):

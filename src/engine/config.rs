@@ -6,6 +6,7 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use crate::mcts::MctsConfig;
+use crate::selfplay::PlayoutCap;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -34,10 +35,18 @@ pub struct SelfPlayConfig {
     pub temperature_moves: usize,
     /// 開局でランダムに打つ手数の上限 (0 で無効)
     pub opening_moves: usize,
+    /// playout cap randomization: 通常の探索 (simulations 回) をする手の割合。1.0 で無効
+    pub full_search_prob: f64,
+    /// それ以外の手の探索回数 (ノイズなし・学習データにしない)
+    pub fast_simulations: u32,
     pub games_per_file: usize,
 }
 
 impl SelfPlayConfig {
+    pub fn playout_cap(&self) -> PlayoutCap {
+        PlayoutCap { full_prob: self.full_search_prob, fast_simulations: self.fast_simulations }
+    }
+
     pub fn mcts(&self) -> MctsConfig {
         MctsConfig {
             simulations: self.simulations,
