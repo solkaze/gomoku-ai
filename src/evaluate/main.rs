@@ -11,7 +11,7 @@ use std::thread;
 use anyhow::bail;
 use clap::Parser;
 use gomoku_engine::config::Config;
-use gomoku_engine::inference::InferenceServer;
+use gomoku_engine::inference::{self, InferenceServer};
 use gomoku_engine::selfplay::{play_match, random_opening};
 use gomoku_engine::{GameResult, Mcts, Stone};
 use rand::SeedableRng;
@@ -80,7 +80,11 @@ impl Summary {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    inference::exit(run())
+}
+
+fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)?;
     let games = args.games.unwrap_or(config.evaluate.games);

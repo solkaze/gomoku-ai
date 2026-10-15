@@ -1,17 +1,17 @@
-//! 行単位の表示での対戦。座標を「x y」で入力する。
+//! 行単位の表示での対局。座標を「x y」で入力する。
 
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
 use gomoku_engine::inference::LoadStage;
-use gomoku_engine::{Board, CELLS, CENTER, GameResult, SIZE, SearchResult, Stone, pos};
+use gomoku_engine::{Board, CELLS, CENTER, GameResult, Rules, SIZE, SearchResult, Stone, pos};
 
-use crate::{Engine, Game, Setup, coord, top_candidates};
+use crate::{Engine, Game, Mode, RULES_WARNING, Setup, clock, coord, forbidden_note, top_candidates};
 
 const HELP: &str = "\
   7 7 など    その点に打つ (x y の順。x は左から、y は上から、どちらも 0〜14)
-  undo        自分の直前の手まで戻す
-  hint        今の局面での AI の読みを表示する
+  undo        自分の直前の手まで戻す (自由対局では 1 手戻す)
+  hint        今の局面での AI の読みを表示する (自由対局では使えない)
   help        この説明
   quit        終了";
 
@@ -27,19 +27,20 @@ fn parse_coord(s: &str) -> Option<usize> {
     Some(pos(y, x))
 }
 
-/// 人が先手 (黒) と後手 (白) のどちらを持つかを尋ねる。入力が尽きたら None。
-fn ask_color(stdin: &mut impl BufRead) -> io::Result<Option<Stone>> {
+/// 人が先手 (黒) と後手 (白) のどちらを持つか、または自由対局にするかを尋ねる。入力が尽きたら None。
+fn ask_mode(stdin: &mut impl BufRead) -> io::Result<Option<Mode>> {
     loop {
-        print!("先手 (黒) と後手 (白) のどちらを持ちますか? [1: 先手 / 2: 後手] > ");
+        print!("先手 (黒) と後手 (白) のどちらを持ちますか? [1: 先手 / 2: 後手 / 3: 自由対局 (AI なし)] > ");
         io::stdout().flush()?;
         let mut line = String::new();
         if stdin.read_line(&mut line)? == 0 {
             return Ok(None);
         }
         match line.trim() {
-            "1" | "先手" | "黒" => return Ok(Some(Stone::Black)),
-            "2" | "後手" | "白" => return Ok(Some(Stone::White)),
-            _ => println!("1 か 2 を入力してください"),
+            "1" | "先手" | "黒" => return Ok(Some(Mode::VsAi(Stone::Black))),
+            "2" | "後手" | "白" => return Ok(Some(Mode::VsAi(Stone::White))),
+            "3" | "自由" | "自由対局" => return Ok(Some(Mode::Free)),
+            _ => println!("1〜3 を入力してください"),
         }
     }
 }
@@ -92,36 +93,62 @@ fn print_analysis(result: &SearchResult, candidates: usize) {
 }
 
 pub fn run(setup: Setup) -> anyhow::Result<()> {
-    println!("モデル: {} ({:?}, 探索 {} 回/手)", setup.model_path.display(), setup.inference.device, setup.mcts.simulations);
-    let stages = LoadStage::stages(setup.inference.device);
-    let start = Instant::now();
-    let mut engine = Engine::load(&setup, &mut |stage| {
-        let n = stages.iter().position(|&s| s == stage).map_or(0, |i| i + 1);
-        println!("[{n}/{}] {}...", stages.len(), stage.label());
-    })?;
-    println!("読み込み完了 ({:.1} 秒)", start.elapsed().as_secs_f64());
+    // 自由対局だけなら AI は要らないので、モデルを読み込まない
+    let mut engine = if setup.mode == Some(Mode::Free) {
+        None
+    } else {
+        println!("モデル: {} ({:?}, 探索 {} 回/手)", setup.model_path.display(), setup.inference.device, setup.mcts.simulations);
+        let stages = LoadStage::stages(setup.inference.device);
+        let start = Instant::now();
+        let engine = Engine::load(&setup, &mut |stage| {
+            let n = stages.iter().position(|&s| s == stage).map_or(0, |i| i + 1);
+            println!("[{n}/{}] {}...", stages.len(), stage.label());
+        })?;
+        println!("読み込み完了 ({:.1} 秒)", start.elapsed().as_secs_f64());
+        Some(engine)
+    };
 
     let mut stdin = io::stdin().lock();
-    let human = match setup.color {
-        Some(stone) => stone,
-        None => match ask_color(&mut stdin)? {
-            Some(stone) => stone,
+    let mode = match setup.mode {
+        Some(mode) => mode,
+        None => match ask_mode(&mut stdin)? {
+            Some(mode) => mode,
             None => return Ok(()),
         },
     };
-    println!("あなたは{}です。黒は三三・四四・長連が禁じ手で、打つと負け (! で表示)。\n{HELP}\n", stone_name(human));
+    let intro = match mode {
+        Mode::VsAi(human) => format!("あなたは{}です。", stone_name(human)),
+        Mode::Free => "自由対局です (AI なし)。黒と白を交互に打ちます。".to_string(),
+    };
+    let rules = setup.rules;
+    let mark = if rules == Rules::none() { "" } else { " (! で表示)" };
+    println!("{intro}黒: {}{mark}。", forbidden_note(rules));
+    if rules != Rules::default() {
+        if !rules.overline {
+            println!("長連が禁じ手でないので、黒も六以上の連で勝ちになります。");
+        }
+        if matches!(mode, Mode::VsAi(_)) {
+            println!("注意: {RULES_WARNING}。");
+        }
+    }
+    println!("{HELP}\n");
 
-    let mut game = Game::new();
+    let mut game = Game::new(rules);
     loop {
         let side = game.board.side_to_move();
-        let forbidden = (side == Stone::Black && human == Stone::Black).then(|| game.board.forbidden_mask());
+        let forbidden = (side == Stone::Black && mode.is_human(side)).then(|| game.board.forbidden_mask());
         println!("\n{}", render(&game.board, forbidden.as_ref()));
 
         match game.board.result() {
             GameResult::Ongoing => {}
             GameResult::Win(winner) => {
                 let note = if game.board.lost_by_forbidden() { " (黒の禁じ手)" } else { "" };
-                println!("{}の勝ちです{note}", if winner == human { "あなた" } else { "AI " });
+                let name = match mode {
+                    Mode::VsAi(human) if winner == human => "あなた",
+                    Mode::VsAi(_) => "AI ",
+                    Mode::Free => stone_name(winner),
+                };
+                println!("{name}の勝ちです{note}");
                 break;
             }
             GameResult::Draw => {
@@ -130,7 +157,8 @@ pub fn run(setup: Setup) -> anyhow::Result<()> {
             }
         }
 
-        if side != human {
+        if !mode.is_human(side) {
+            let engine = engine.as_mut().expect("AI との対戦ではモデルを読み込んでいる");
             let start = Instant::now();
             let result = engine.search(&game.board);
             let mv = result.best_move();
@@ -147,7 +175,7 @@ pub fn run(setup: Setup) -> anyhow::Result<()> {
         }
 
         loop {
-            print!("{} {}手目 > ", stone_name(side), game.board.move_count() + 1);
+            print!("{} {}手目 [対局 {}] > ", stone_name(side), game.board.move_count() + 1, clock(game.elapsed()));
             io::stdout().flush()?;
             let mut line = String::new();
             if stdin.read_line(&mut line)? == 0 {
@@ -158,20 +186,31 @@ pub fn run(setup: Setup) -> anyhow::Result<()> {
                 "quit" | "exit" => return Ok(()),
                 "help" | "?" => println!("{HELP}"),
                 "undo" => {
-                    if !game.undo(human) {
+                    if !game.undo(mode) {
                         println!("戻せる手がありません");
                         continue;
                     }
                     break;
                 }
-                "hint" => {
-                    let result = engine.search(&game.board);
-                    print_analysis(&result, setup.candidates.max(5));
-                }
+                "hint" => match (mode, engine.as_mut()) {
+                    (Mode::VsAi(_), Some(engine)) => {
+                        let result = engine.search(&game.board);
+                        print_analysis(&result, setup.candidates.max(5));
+                    }
+                    _ => println!("自由対局ではヒントは使えません"),
+                },
                 input => match parse_coord(input) {
                     None => println!("座標は 7 7 のように 0〜14 の数字 2 つを半角スペース区切りで入力してください (help で説明)"),
                     Some(p) => match game.play(p) {
-                        Ok(_) => break,
+                        Ok(_) => {
+                            let who = match mode {
+                                Mode::VsAi(_) => format!("あなた ({})", stone_name(side)),
+                                Mode::Free => stone_name(side).to_string(),
+                            };
+                            let secs = game.times.last().map_or(0.0, |t| t.as_secs_f64());
+                            println!("{who}: ({}) ({secs:.1} 秒)", coord(p));
+                            break;
+                        }
                         Err(e) => println!("({}): {e}", coord(p)),
                     },
                 },
@@ -179,6 +218,6 @@ pub fn run(setup: Setup) -> anyhow::Result<()> {
         }
     }
 
-    println!("\n棋譜: {}", game.record());
+    println!("\n{}", game.record());
     Ok(())
 }

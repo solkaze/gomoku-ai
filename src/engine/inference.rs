@@ -1,13 +1,16 @@
 //! ONNX モデル (src/train/export.py が書き出したもの) の推論。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::Context;
+use ort::AsPointer;
+use ort::environment::Environment;
 use ort::ep;
 use ort::session::Session;
 use ort::value::Tensor;
@@ -82,10 +85,56 @@ pub fn init_runtime_with(config: &InferenceConfig, on_stage: &mut dyn FnMut(Load
             on_stage(LoadStage::Runtime);
             let lib = find_onnxruntime(&config.onnxruntime_dir).map_err(|e| format!("{e:#}"))?;
             ort::init_from(&lib).map_err(|e| format!("{} を読み込めません: {e}", lib.display()))?.commit();
+            RUNTIME_LOADED.store(true, Ordering::Relaxed);
             Ok(())
         })
         .clone()
         .map_err(anyhow::Error::msg)
+}
+
+/// onnxruntime を読み込んだか (読み込んでいなければ、終了時に解放するものもない)
+static RUNTIME_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// ONNX Runtime の環境 (OrtEnv) を今すぐ解放する。セッションが残っていて解放できなければ false。
+///
+/// OrtEnv は、ライブラリの静的オブジェクトが破棄される前に解放しなければならない。ort は終了時に自動で解放するが、
+/// その時点 (実行ファイルの .fini_array) では、後から dlopen した CUDA プロバイダの静的オブジェクトが既に
+/// 破棄されている (dlopen したライブラリのデストラクタは exit の早い段階で呼ばれる)。その状態で解放すると、
+/// プロバイダが解放済みのメモリの参照カウントを書き換え、ヒープが壊れる (終了時にまれに
+/// 「corrupted double-linked list」で異常終了する)。そこで、終了処理が始まる前に自分で解放する。
+fn release_environment() -> bool {
+    let Ok(env) = Environment::current() else { return false };
+    // ort 自身が持つ参照と、今取得した参照。それ以外があれば、まだセッションが生きている
+    if Arc::strong_count(&env) != 2 {
+        return false;
+    }
+    let ptr = env.ptr().cast_mut();
+    // 参照を 1 つ捨てずに残し、ort が終了時にもう一度解放しないようにする
+    std::mem::forget(env);
+    // SAFETY: ptr は ort が作った有効な OrtEnv で、これを使うセッションは残っていない。
+    // ort 側の解放は上で止めたので、二重に解放されることもない
+    unsafe { (ort::api().ReleaseEnv)(ptr) };
+    true
+}
+
+/// main の結果を表示してプロセスを終了する。推論に使ったモデル (セッション) を全て破棄してから呼ぶこと。
+pub fn exit(result: anyhow::Result<()>) -> ! {
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            1
+        }
+    };
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    if !RUNTIME_LOADED.load(Ordering::Relaxed) || release_environment() {
+        std::process::exit(code);
+    }
+    // エラーの途中などでセッションが残っていると、正しい順序で解放できない。
+    // そのまま終了処理に入るとヒープを壊しうるので、終了処理を飛ばして終わる
+    // SAFETY: _exit は何も後始末をせずにプロセスを終えるだけで、呼び出しに前提条件はない
+    unsafe { libc::_exit(code) }
 }
 
 /// dir の中の libonnxruntime.so.<バージョン> を探す。

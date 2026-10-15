@@ -22,7 +22,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.98.1
 
 # uv (Python 本体も uv が .python-version に従って入れる)
-COPY --from=ghcr.io/astral-sh/uv:0.12.19 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.24 /uv /uvx /usr/local/bin/
 ENV UV_LINK_MODE=copy \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python
 

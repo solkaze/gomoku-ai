@@ -1,5 +1,5 @@
 use super::{black_to_move, board};
-use crate::{Board, CELLS, CENTER, GameResult, MoveError, Stone, pos};
+use crate::{Board, CELLS, CENTER, GameResult, MoveError, Rules, Stone, pos};
 
 #[test]
 fn first_move_must_be_center() {
@@ -154,4 +154,58 @@ fn legal_moves_include_forbidden_points() {
     let moves = b.legal_moves();
     assert!(moves.contains(&pos(7, 7)));
     assert_eq!(moves.len(), CELLS - 4);
+}
+
+fn with_rules(mut b: Board, rules: Rules) -> Board {
+    b.set_rules(rules);
+    b
+}
+
+#[test]
+fn disabled_double_three_is_not_forbidden() {
+    let stones = [(7, 5), (7, 6), (5, 7), (6, 7)];
+    assert!(black_to_move(&stones, &[]).is_forbidden(pos(7, 7)));
+    let b = with_rules(black_to_move(&stones, &[]), Rules { double_three: false, ..Rules::default() });
+    assert!(!b.is_forbidden(pos(7, 7)));
+    // 他の禁じ手を無効にしても三三は残る
+    let b = with_rules(black_to_move(&stones, &[]), Rules { double_four: false, overline: false, ..Rules::default() });
+    assert!(b.is_forbidden(pos(7, 7)));
+}
+
+#[test]
+fn disabled_double_four_is_not_forbidden() {
+    // 一直線の四四 ●・●●p・●
+    let stones = [(7, 3), (7, 5), (7, 7), (7, 9)];
+    assert!(black_to_move(&stones, &[]).is_forbidden(pos(7, 6)));
+    let b = with_rules(black_to_move(&stones, &[]), Rules { double_four: false, ..Rules::default() });
+    assert!(!b.is_forbidden(pos(7, 6)));
+    let b = with_rules(black_to_move(&stones, &[]), Rules { double_three: false, overline: false, ..Rules::default() });
+    assert!(b.is_forbidden(pos(7, 6)));
+}
+
+#[test]
+fn disabled_overline_wins_for_black() {
+    let rules = Rules { overline: false, ..Rules::default() };
+    let mut b = with_rules(black_to_move(&[(7, 2), (7, 3), (7, 4), (7, 6), (7, 7)], &[]), rules);
+    assert!(!b.is_forbidden(pos(7, 5)));
+    assert_eq!(b.winning_moves(Stone::Black), vec![pos(7, 5)]);
+    assert_eq!(b.play(pos(7, 5)), Ok(GameResult::Win(Stone::Black)));
+    assert!(!b.lost_by_forbidden());
+}
+
+#[test]
+fn disabled_overline_makes_overline_three_a_real_three() {
+    // 長連が禁じ手なら三ではない形 (three_that_can_only_become_overline_is_not_three) も、長連が勝ちなら三三になる
+    let rules = Rules { overline: false, ..Rules::default() };
+    let b = with_rules(black_to_move(&[(7, 0), (7, 3), (7, 4), (7, 8), (5, 5), (6, 5)], &[]), rules);
+    assert!(b.is_forbidden(pos(7, 5)));
+}
+
+#[test]
+fn all_rules_disabled_forbids_nothing() {
+    let rules = Rules::none();
+    for stones in [vec![(7, 5), (7, 6), (5, 7), (6, 7)], vec![(7, 3), (7, 5), (7, 7), (7, 9)]] {
+        let b = with_rules(black_to_move(&stones, &[]), rules);
+        assert!(b.forbidden_mask().iter().all(|&f| !f));
+    }
 }

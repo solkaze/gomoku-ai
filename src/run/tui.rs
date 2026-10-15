@@ -21,9 +21,11 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use gomoku_engine::inference::LoadStage;
-use gomoku_engine::{Board, CELLS, CENTER, GameResult, SIZE, SearchResult, Stone, pos};
+use gomoku_engine::{Board, CELLS, CENTER, GameResult, Rules, SIZE, SearchResult, Stone, pos};
 
-use crate::{Engine, Game, Setup, coord, top_candidates};
+use crate::{
+    Engine, Forbidden, Game, Mode, RULES_WARNING, Setup, clock, coord, forbidden_names, forbidden_note, top_candidates,
+};
 
 type Rgb = (u8, u8, u8);
 
@@ -45,13 +47,16 @@ const BAR_REST: Rgb = (70, 70, 70);
 const STARS: [usize; 5] = [pos(3, 3), pos(3, 11), CENTER, pos(11, 3), pos(11, 11)];
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TITLE: &str = "五目並べ (連珠) ― AI と対戦";
+const TITLE_FREE: &str = "五目並べ (連珠) ― 自由対局 (AI なし)";
+/// 対局開始時の選択肢
+const MODES: [Mode; 3] = [Mode::VsAi(Stone::Black), Mode::VsAi(Stone::White), Mode::Free];
 
 /// 盤の左上 (目盛りの分だけ空ける)
 const BOARD_X: u16 = 4;
 const BOARD_Y: u16 = 2;
 /// 盤の横や下に置く情報欄に確保する大きさ
 const PANEL_W: u16 = 40;
-const PANEL_H: u16 = 20;
+const PANEL_H: u16 = 22;
 
 /// 端末が 24bit 色に対応していなければ 256 色に丸める。
 fn color((r, g, b): Rgb) -> Color {
@@ -82,6 +87,13 @@ fn stone_name(stone: Stone) -> &'static str {
     match stone {
         Stone::Black => "黒 (先手)",
         Stone::White => "白 (後手)",
+    }
+}
+
+fn short_name(stone: Stone) -> &'static str {
+    match stone {
+        Stone::Black => "黒",
+        Stone::White => "白",
     }
 }
 
@@ -254,17 +266,22 @@ impl Analysis {
 
 struct App {
     setup: Arc<Setup>,
-    requests: Sender<Board>,
+    /// 探索スレッドへの依頼 (AI を使わない起動では None)
+    requests: Option<Sender<Board>>,
     screen: Screen,
     started: Instant,
     /// 読み込みで通った段階と、それぞれに入った時刻
     stages: Vec<(LoadStage, Instant)>,
     load_secs: f64,
-    /// 先手・後手の選択でカーソルがある側
-    choice: Stone,
-    /// 先手・後手の選択肢を描いた行 (クリックの判定用)
-    choice_rows: [u16; 2],
-    human: Stone,
+    /// 対局の形式の選択でカーソルがある選択肢 (MODES の添字)
+    choice: usize,
+    /// 選択肢を描いた行 (クリックの判定用)
+    choice_rows: [u16; MODES.len()],
+    /// 黒に適用する禁じ手 (対局の形式の選択画面で切り替える。次の対局にも引き継ぐ)
+    rules: Rules,
+    /// 禁じ手の切り替えを描いた行 (クリックの判定用。Forbidden::ALL の順)
+    rule_rows: [u16; Forbidden::ALL.len()],
+    mode: Mode,
     game: Game,
     cursor: usize,
     pending: Option<(Pending, Instant)>,
@@ -280,18 +297,21 @@ struct App {
 }
 
 impl App {
-    fn new(setup: Arc<Setup>, requests: Sender<Board>) -> Self {
-        Self {
+    fn new(setup: Arc<Setup>, requests: Option<Sender<Board>>) -> Self {
+        let rules = setup.rules;
+        let mut app = Self {
             setup,
             requests,
             screen: Screen::Loading,
             started: Instant::now(),
             stages: Vec::new(),
             load_secs: 0.0,
-            choice: Stone::Black,
-            choice_rows: [0; 2],
-            human: Stone::Black,
-            game: Game::new(),
+            choice: 0,
+            choice_rows: [0; MODES.len()],
+            rules,
+            rule_rows: [0; Forbidden::ALL.len()],
+            mode: MODES[0],
+            game: Game::new(rules),
             cursor: CENTER,
             pending: None,
             ai_move: None,
@@ -300,7 +320,12 @@ impl App {
             records: Vec::new(),
             layout: None,
             clear: true,
+        };
+        // 読み込むものがなければ、すぐ対局を始める
+        if app.requests.is_none() {
+            app.start_game(Mode::Free);
         }
+        app
     }
 
     fn spinner(&self) -> &'static str {
@@ -312,9 +337,9 @@ impl App {
         self.clear = true;
     }
 
-    fn start_game(&mut self, human: Stone) {
-        self.human = human;
-        self.game = Game::new();
+    fn start_game(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.game = Game::new(self.rules);
         self.cursor = CENTER;
         self.ai_move = None;
         self.hint = None;
@@ -330,24 +355,32 @@ impl App {
         if !self.game.moves.is_empty() {
             self.records.push(self.game.record());
         }
-        match self.setup.color {
-            Some(human) => self.start_game(human),
+        match self.setup.mode {
+            Some(mode) => self.start_game(mode),
             None => {
-                self.game = Game::new();
+                self.game = Game::new(self.rules);
                 self.show(Screen::ChooseColor);
             }
         }
     }
 
+    /// 対局前に、禁じ手の有効・無効を切り替える。
+    fn toggle_rule(&mut self, kind: Forbidden) {
+        let on = kind.enabled(self.rules);
+        kind.set(&mut self.rules, !on);
+    }
+
     fn human_to_move(&self) -> bool {
         self.pending.is_none()
             && self.game.board.result() == GameResult::Ongoing
-            && self.game.board.side_to_move() == self.human
+            && self.mode.is_human(self.game.board.side_to_move())
     }
 
     fn request(&mut self, pending: Pending) {
         // 探索スレッドが止まっていれば、次の受信で検出する
-        let _ = self.requests.send(self.game.board.clone());
+        if let Some(requests) = &self.requests {
+            let _ = requests.send(self.game.board.clone());
+        }
         self.pending = Some((pending, Instant::now()));
     }
 
@@ -359,7 +392,7 @@ impl App {
         if self.game.board.result() != GameResult::Ongoing {
             return;
         }
-        if self.game.board.side_to_move() != self.human {
+        if !self.mode.is_human(self.game.board.side_to_move()) {
             self.request(Pending::AiMove);
         } else if self.game.board.move_count() == 0 {
             self.game.play(CENTER).expect("天元は合法手");
@@ -373,8 +406,8 @@ impl App {
             Reply::Failed(e) => return Err(e),
             Reply::Ready => {
                 self.load_secs = self.started.elapsed().as_secs_f64();
-                match self.setup.color {
-                    Some(human) => self.start_game(human),
+                match self.setup.mode {
+                    Some(mode) => self.start_game(mode),
                     None => self.show(Screen::ChooseColor),
                 }
             }
@@ -413,17 +446,22 @@ impl App {
     fn undo(&mut self) {
         if self.pending.is_some() {
             self.message = "AI の思考が終わるまでお待ちください".into();
-        } else if self.game.undo(self.human) {
+        } else if self.game.undo(self.mode) {
             self.ai_move = None;
             self.hint = None;
-            self.message = "あなたの直前の手まで戻しました".into();
+            self.message = match self.mode {
+                Mode::VsAi(_) => "あなたの直前の手まで戻しました".into(),
+                Mode::Free => "1 手戻しました".into(),
+            };
         } else {
             self.message = "戻せる手がありません".into();
         }
     }
 
     fn ask_hint(&mut self) {
-        if self.human_to_move() {
+        if self.mode == Mode::Free {
+            self.message = "自由対局ではヒントは使えません".into();
+        } else if self.human_to_move() {
             self.request(Pending::Hint);
         } else if self.pending.is_some() {
             self.message = "AI の思考が終わるまでお待ちください".into();
@@ -447,12 +485,15 @@ impl App {
                 match self.screen {
                     Screen::Loading => {}
                     Screen::ChooseColor => match key.code {
-                        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                            self.choice = self.choice.opponent()
-                        }
-                        KeyCode::Char('1') => self.start_game(Stone::Black),
-                        KeyCode::Char('2') => self.start_game(Stone::White),
-                        KeyCode::Enter | KeyCode::Char(' ') => self.start_game(self.choice),
+                        KeyCode::Up | KeyCode::Left => self.choice = (self.choice + MODES.len() - 1) % MODES.len(),
+                        KeyCode::Down | KeyCode::Right | KeyCode::Tab => self.choice = (self.choice + 1) % MODES.len(),
+                        KeyCode::Char('1') => self.start_game(MODES[0]),
+                        KeyCode::Char('2') => self.start_game(MODES[1]),
+                        KeyCode::Char('3') => self.start_game(MODES[2]),
+                        KeyCode::Char('4') => self.toggle_rule(Forbidden::ALL[0]),
+                        KeyCode::Char('5') => self.toggle_rule(Forbidden::ALL[1]),
+                        KeyCode::Char('6') => self.toggle_rule(Forbidden::ALL[2]),
+                        KeyCode::Enter | KeyCode::Char(' ') => self.start_game(MODES[self.choice]),
                         _ => {}
                     },
                     Screen::Playing => match key.code {
@@ -474,7 +515,9 @@ impl App {
                     Screen::Loading => {}
                     Screen::ChooseColor if click => {
                         if let Some(i) = self.choice_rows.iter().position(|&row| row == mouse.row) {
-                            self.start_game([Stone::Black, Stone::White][i]);
+                            self.start_game(MODES[i]);
+                        } else if let Some(i) = self.rule_rows.iter().position(|&row| row == mouse.row) {
+                            self.toggle_rule(Forbidden::ALL[i]);
                         }
                     }
                     Screen::ChooseColor => {}
@@ -506,15 +549,24 @@ impl App {
                 draw_lines(&mut out, 2, 1, rows, &lines)?;
             }
             Screen::ChooseColor => {
-                let (lines, choice_rows) = self.choose_lines();
+                let (lines, choice_rows, rule_rows) = self.choose_lines();
                 self.choice_rows = choice_rows.map(|i| 1 + i as u16);
+                self.rule_rows = rule_rows.map(|i| 1 + i as u16);
                 draw_lines(&mut out, 2, 1, rows, &lines)?;
             }
             Screen::Playing => {
                 self.layout = Layout::fit(cols, rows);
                 match self.layout {
                     Some(lay) => {
-                        queue!(out, MoveTo(1, 0), Print(TITLE.bold()), Print(format!("   {}", self.setup.describe()).dark_grey()))?;
+                        match self.mode {
+                            Mode::VsAi(_) => queue!(
+                                out,
+                                MoveTo(1, 0),
+                                Print(TITLE.bold()),
+                                Print(format!("   {}", self.setup.describe()).dark_grey())
+                            )?,
+                            Mode::Free => queue!(out, MoveTo(1, 0), Print(TITLE_FREE.bold()))?,
+                        }
                         self.draw_board(&mut out, &lay)?;
                         draw_lines(&mut out, lay.px, lay.py, rows, &self.panel_lines(&lay))?;
                     }
@@ -572,45 +624,89 @@ impl App {
         lines
     }
 
-    /// 先手・後手の選択画面の行と、そのうち選択肢 (先手、後手) の行番号。
-    fn choose_lines(&self) -> (Vec<String>, [usize; 2]) {
+    /// 対局の形式の選択画面の行と、そのうち選択肢 (MODES の順) と禁じ手の切り替え (Forbidden::ALL の順) の行番号。
+    fn choose_lines(&self) -> (Vec<String>, [usize; MODES.len()], [usize; Forbidden::ALL.len()]) {
         let mut lines = vec![
             TITLE.bold().to_string(),
             String::new(),
             format!("モデル: {}", self.setup.describe()),
             format!("{} 読み込み完了 ({:.1} 秒)", "✔".with(color(GOOD)), self.load_secs),
             String::new(),
-            "先手・後手を選んでください".to_string(),
+            "先手・後手、または自由対局を選んでください".to_string(),
             String::new(),
         ];
         let first = lines.len();
-        for (key, stone, note) in [(1, Stone::Black, "三三・四四・長連は禁じ手 (打つと負け)"), (2, Stone::White, "")] {
-            let label = format!("{key}  {} {}", chip(stone), stone_name(stone));
-            lines.push(if stone == self.choice {
+        let black_note = forbidden_note(self.rules);
+        for (i, mode) in MODES.into_iter().enumerate() {
+            let (name, note) = match mode {
+                Mode::VsAi(Stone::Black) => (chip(Stone::Black) + " 黒 (先手)", black_note.as_str()),
+                Mode::VsAi(Stone::White) => (chip(Stone::White) + " 白 (後手)", ""),
+                Mode::Free => (chip(Stone::Black) + &chip(Stone::White) + " 自由対局", "AI を使わず、黒と白の両方を自分で打つ"),
+            };
+            let label = format!("{}  {name}", i + 1);
+            lines.push(if i == self.choice {
                 format!(" {} {}   {}", "▶".with(color(CURSOR)), label.bold(), note.dark_grey())
             } else {
                 format!("   {label}   {}", note.dark_grey())
             });
             lines.push(String::new());
         }
-        lines.push("↑↓ で選んで Enter (1 / 2 キーやクリックでも選べます)   q 終了".dark_grey().to_string());
-        (lines, [first, first + 2])
+        lines.push("黒の禁じ手 (4〜6 キーかクリックで有効・無効を切り替え)".to_string());
+        let first_rule = lines.len();
+        for (i, kind) in Forbidden::ALL.into_iter().enumerate() {
+            let state = if kind.enabled(self.rules) {
+                "有効".with(color(GOOD)).bold().to_string()
+            } else {
+                "無効".with(color(BAD)).bold().to_string()
+            };
+            let note = match (kind, kind.enabled(self.rules)) {
+                (Forbidden::Overline, false) => "黒も六以上の連で勝ち",
+                (_, false) => "黒も打てる",
+                (_, true) => "",
+            };
+            lines.push(format!("   {}  {}  {state}   {}", i + MODES.len() + 1, kind.name(), note.dark_grey()));
+        }
+        // 行数が変わると選択肢の位置がずれるので、注意がないときも 1 行空ける
+        let warning = if self.rules == Rules::default() { "" } else { RULES_WARNING };
+        lines.push(format!("   {}", warning.with(color(NOTE))));
+        lines.push(String::new());
+        lines.push("↑↓ で選んで Enter (1〜3 キーやクリックでも選べます)   q 終了".dark_grey().to_string());
+        (lines, std::array::from_fn(|i| first + 2 * i), std::array::from_fn(|i| first_rule + i))
     }
 
     fn panel_lines(&self, lay: &Layout) -> Vec<String> {
         let board = &self.game.board;
-        let ai = self.human.opponent();
+        let game = &self.game;
+        // 時間を表示する順 (人、AI。自由対局では黒、白) と、それぞれの呼び名
+        let sides = match self.mode {
+            Mode::VsAi(human) => [(human, "あなた"), (human.opponent(), "AI")],
+            Mode::Free => [(Stone::Black, "黒"), (Stone::White, "白")],
+        };
         let mut lines = vec![
-            format!("あなた {} {}   AI {} {}", chip(self.human), stone_name(self.human), chip(ai), stone_name(ai)),
+            match self.mode {
+                Mode::VsAi(human) => {
+                    let ai = human.opponent();
+                    format!("あなた {} {}   AI {} {}", chip(human), stone_name(human), chip(ai), stone_name(ai))
+                }
+                Mode::Free => format!("{} 黒と {} 白を交互に自分で打つ", chip(Stone::Black), chip(Stone::White)),
+            },
+            format!(
+                "対局時間 {}   {} {}   {} {}",
+                clock(game.elapsed()).bold(),
+                sides[0].1,
+                clock(game.total(sides[0].0)),
+                sides[1].1,
+                clock(game.total(sides[1].0))
+            ),
             String::new(),
         ];
         lines.push(match (board.result(), &self.pending) {
             (GameResult::Win(winner), _) => {
                 let note = if board.lost_by_forbidden() { "黒の禁じ手・" } else { "" };
-                let text = if winner == self.human {
-                    "あなたの勝ちです".with(color(GOOD)).bold()
-                } else {
-                    "AI の勝ちです".with(color(BAD)).bold()
+                let text = match self.mode {
+                    Mode::VsAi(human) if winner == human => "あなたの勝ちです".to_string().with(color(GOOD)).bold(),
+                    Mode::VsAi(_) => "AI の勝ちです".to_string().with(color(BAD)).bold(),
+                    Mode::Free => format!("{}の勝ちです", short_name(winner)).with(color(GOOD)).bold(),
                 };
                 format!("{text} ({note}{} 手)", board.move_count())
             }
@@ -624,12 +720,16 @@ impl App {
                 },
                 start.elapsed().as_secs_f64()
             ),
-            (GameResult::Ongoing, None) => format!(
-                "{} {} 手目   カーソル ({})",
-                "あなたの番です".bold(),
-                board.move_count() + 1,
-                coord(self.cursor)
-            ),
+            (GameResult::Ongoing, None) => {
+                let turn = match self.mode {
+                    Mode::VsAi(_) => "あなたの番です".bold().to_string(),
+                    Mode::Free => {
+                        let side = board.side_to_move();
+                        format!("{} {}", chip(side), format!("{}の番です", short_name(side)).bold())
+                    }
+                };
+                format!("{turn} {} 手目  {:.1} 秒", board.move_count() + 1, game.thinking().as_secs_f64())
+            }
         });
         lines.push(self.message.as_str().with(color(NOTE)).to_string());
         lines.push(String::new());
@@ -643,6 +743,21 @@ impl App {
                 })
                 .collect()
         };
+        // 人の直前の手とかかった時間 (天元に固定の初手は除く)
+        let human_moves: Vec<String> = sides
+            .iter()
+            .filter(|&&(stone, _)| self.mode.is_human(stone))
+            .filter_map(|&(stone, name)| {
+                let (i, mv, time) = game.last_move_by(stone).filter(|&(i, ..)| i > 0)?;
+                let label = format!("{name}の着手").bold();
+                let time = format!("{:.1} 秒 ({} 手目)", time.as_secs_f64(), i + 1).dark_grey();
+                Some(format!("{label} ({})  {time}", coord(mv)))
+            })
+            .collect();
+        if !human_moves.is_empty() {
+            lines.extend(human_moves);
+            lines.push(String::new());
+        }
         if let Some((mv, secs, analysis)) = &self.ai_move {
             lines.push(format!("{} ({})  {}", "AI の着手".bold(), coord(*mv), format!("{secs:.1} 秒").dark_grey()));
             lines.push(format!("  {}  AI の勝率見込み {:.0}%", bar(analysis.win_rate, 16, BAD), analysis.win_rate));
@@ -660,11 +775,18 @@ impl App {
 
         let last_mark = if lay.large() { "赤い点" } else { "赤いマス" };
         let keys = [
-            "←↑↓→・マウス: カーソル移動".to_string(),
+            format!("カーソル ({})   ←↑↓→・マウス: 移動", coord(self.cursor)),
             "Enter・クリック: 打つ".to_string(),
-            "u: 待った   h: ヒント".to_string(),
+            match self.mode {
+                Mode::VsAi(_) => "u: 待った   h: ヒント".to_string(),
+                Mode::Free => "u: 1 手戻す".to_string(),
+            },
             "n: 新しい対局   q: 終了".to_string(),
-            format!("{last_mark}: 直前の手   {}: 黒の禁じ手 (打つと負け)", "×".with(color(MARK))),
+            format!(
+                "{last_mark}: 直前の手   {}: 禁じ手 ({})",
+                "×".with(color(MARK)),
+                forbidden_names(board.rules()).as_deref().unwrap_or("なし")
+            ),
         ];
         lines.extend(keys.into_iter().map(|line| line.dark_grey().to_string()));
         lines
@@ -673,7 +795,7 @@ impl App {
     fn draw_board(&self, out: &mut Vec<u8>, lay: &Layout) -> io::Result<()> {
         let board = &self.game.board;
         let human_to_move = self.human_to_move();
-        let forbidden = (human_to_move && self.human == Stone::Black).then(|| board.forbidden_mask());
+        let forbidden = (human_to_move && board.side_to_move() == Stone::Black).then(|| board.forbidden_mask());
         let win = winning_line(board);
         let hints: &[(usize, f64)] = self.hint.as_ref().map_or(&[], |hint| &hint.candidates);
 
@@ -703,11 +825,11 @@ impl App {
             } else {
                 WOOD[(r + c) % 2]
             };
-            // カーソルのある空点には、打てる場合に限り自分の石を薄く見せる
+            // カーソルのある空点には、打てる場合に限り手番の石を薄く見せる
             let ghost = is_cursor && human_to_move && stone.is_none() && !is_forbidden && hint.is_none();
             let disc = match stone {
                 Some(stone) => Some(stone_color(stone)),
-                None if ghost => Some(blend(stone_color(self.human), bg)),
+                None if ghost => Some(blend(stone_color(board.side_to_move()), bg)),
                 None => None,
             };
 
@@ -742,9 +864,9 @@ impl App {
         queue!(out, ResetColor)
     }
 
-    fn event_loop(&mut self, replies: &Receiver<Reply>) -> anyhow::Result<()> {
+    fn event_loop(&mut self, replies: Option<&Receiver<Reply>>) -> anyhow::Result<()> {
         loop {
-            loop {
+            while let Some(replies) = replies {
                 match replies.try_recv() {
                     Ok(reply) => self.on_reply(reply)?,
                     Err(TryRecvError::Empty) => break,
@@ -754,8 +876,12 @@ impl App {
             self.advance();
             self.draw()?;
 
-            // 読み込み中と探索中は、経過を表示し続けるために短い間隔で描き直す
-            let animating = matches!(self.screen, Screen::Loading) || self.pending.is_some();
+            // 読み込み中・探索中・対局中は、経過時間を表示し続けるために短い間隔で描き直す
+            let animating = match self.screen {
+                Screen::Loading => true,
+                Screen::ChooseColor => false,
+                Screen::Playing => self.pending.is_some() || self.game.board.result() == GameResult::Ongoing,
+            };
             if event::poll(Duration::from_millis(if animating { 80 } else { 1000 }))? {
                 loop {
                     if self.on_event(event::read()?) {
@@ -782,23 +908,31 @@ fn draw_lines(out: &mut Vec<u8>, x: u16, y: u16, rows: u16, lines: &[String]) ->
 pub fn run(setup: Setup) -> anyhow::Result<()> {
     let setup = Arc::new(setup);
     let stop = Arc::new(AtomicBool::new(false));
-    let (requests, replies, engine) = spawn_engine(Arc::clone(&setup), Arc::clone(&stop));
+    // 自由対局だけなら AI は要らないので、モデルを読み込まない
+    let (requests, replies, engine) = if setup.mode == Some(Mode::Free) {
+        (None, None, None)
+    } else {
+        let (requests, replies, engine) = spawn_engine(Arc::clone(&setup), Arc::clone(&stop));
+        (Some(requests), Some(replies), Some(engine))
+    };
     let mut app = App::new(setup, requests);
     let terminal = Terminal::enter()?;
-    let result = app.event_loop(&replies);
+    let result = app.event_loop(replies.as_ref());
     drop(terminal);
 
     // 推論の最中にプロセスを終えると onnxruntime の後始末と競合して落ちるので、探索スレッドの終了を待つ
     stop.store(true, Ordering::Relaxed);
     let App { requests, game, mut records, .. } = app;
     drop(requests);
-    let _ = engine.join();
+    if let Some(engine) = engine {
+        let _ = engine.join();
+    }
 
     if !game.moves.is_empty() {
         records.push(game.record());
     }
     for record in &records {
-        println!("棋譜: {record}");
+        println!("{record}");
     }
     result
 }

@@ -1,4 +1,4 @@
-//! 連珠ルール(黒のみ三三・四四・長連禁止)の五目並べエンジン。
+//! 連珠ルール(黒のみ三三・四四・長連禁止。種類ごとに無効にもできる)の五目並べエンジン。
 
 pub mod board;
 pub mod config;
@@ -13,4 +13,5 @@ pub mod selfplay;
 mod tests;
 
 pub use board::{Board, CELLS, CENTER, GameResult, MoveError, SIZE, Stone, pos};
+pub use rules::Rules;
 pub use mcts::{Evaluation, Evaluator, Mcts, MctsConfig, SearchResult, UniformEvaluator};

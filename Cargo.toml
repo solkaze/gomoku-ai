@@ -15,6 +15,7 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 rand = "0.9"
 rand_distr = "0.5"
 crossterm = "0.28"
+libc = "0.2"
 
 [lib]
 name = "gomoku_engine"

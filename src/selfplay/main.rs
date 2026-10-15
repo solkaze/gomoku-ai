@@ -14,7 +14,7 @@ use anyhow::bail;
 use clap::Parser;
 use gomoku_engine::config::Config;
 use gomoku_engine::features::{FEATURE_LEN, PLANES};
-use gomoku_engine::inference::InferenceServer;
+use gomoku_engine::inference::{self, InferenceServer};
 use gomoku_engine::npz::{NpyArray, NpyData, write_npz};
 use gomoku_engine::selfplay::{Game, play_game, random_opening};
 use gomoku_engine::{CELLS, GameResult, Mcts, SIZE, Stone};
@@ -37,7 +37,11 @@ struct Args {
     summary: Option<PathBuf>,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    inference::exit(run())
+}
+
+fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)?;
     let sp = &config.selfplay;

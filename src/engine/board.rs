@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::rules::{self, BLACK, EMPTY, WHITE};
+use crate::rules::{self, BLACK, EMPTY, Rules, WHITE};
 
 pub const SIZE: usize = 15;
 pub const CELLS: usize = SIZE * SIZE;
@@ -70,6 +70,7 @@ pub struct Board {
     moves: usize,
     last_move: Option<usize>,
     result: GameResult,
+    rules: Rules,
 }
 
 impl Default for Board {
@@ -79,14 +80,30 @@ impl Default for Board {
 }
 
 impl Board {
+    /// 全ての禁じ手を有効にした盤。
     pub fn new() -> Self {
+        Self::with_rules(Rules::default())
+    }
+
+    /// 黒に適用する禁じ手を指定した盤。
+    pub fn with_rules(rules: Rules) -> Self {
         Self {
             cells: [EMPTY; CELLS],
             side: Stone::Black,
             moves: 0,
             last_move: None,
             result: GameResult::Ongoing,
+            rules,
         }
+    }
+
+    pub fn rules(&self) -> Rules {
+        self.rules
+    }
+
+    /// 適用する禁じ手を変える。それまでの手の勝敗は判定し直さない。
+    pub fn set_rules(&mut self, rules: Rules) {
+        self.rules = rules;
     }
 
     /// 任意の局面を作る(検討・テスト用)。ルールや勝敗の検証はしない。
@@ -135,16 +152,17 @@ impl Board {
     /// 空点 p が黒にとって禁じ手か(手番に関係なく判定する)。
     pub fn is_forbidden(&self, p: usize) -> bool {
         let mut cells = self.cells;
-        cells[p] == EMPTY && rules::is_forbidden(&mut cells, p)
+        cells[p] == EMPTY && rules::is_forbidden(&mut cells, p, self.rules)
     }
 
     /// 黒の禁じ手の点をまとめて求める(手番に関係なく判定する)。
     pub fn forbidden_mask(&self) -> [bool; CELLS] {
         let mut cells = self.cells;
-        std::array::from_fn(|p| cells[p] == EMPTY && rules::is_forbidden(&mut cells, p))
+        std::array::from_fn(|p| cells[p] == EMPTY && rules::is_forbidden(&mut cells, p, self.rules))
     }
 
     /// stone が打てば五になる空点(黒の五は禁じ手より優先されるので常に合法)。
+    /// 長連が禁じ手でなければ、黒の六以上の連も含む。
     pub fn winning_moves(&self, stone: Stone) -> Vec<usize> {
         let color = stone.cell();
         let mut cells = self.cells;
@@ -154,7 +172,7 @@ impl Board {
                     return false;
                 }
                 cells[p] = color;
-                let five = rules::is_five(&cells, p, color);
+                let five = rules::is_five(&cells, p, color, self.rules);
                 cells[p] = EMPTY;
                 five
             })
@@ -197,7 +215,7 @@ impl Board {
 
         if forbidden {
             self.result = GameResult::Win(Stone::White);
-        } else if rules::is_five(&self.cells, p, color) {
+        } else if rules::is_five(&self.cells, p, color, self.rules) {
             self.result = GameResult::Win(self.side);
         } else {
             self.side = self.side.opponent();
