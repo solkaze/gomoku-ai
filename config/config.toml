@@ -62,12 +62,31 @@ temperature_moves = 10
 # 開局のランダム化: 黒の初手 (天元) のあと、0〜この手数 (局ごとに一様に選ぶ) を石の近くにランダムに打ってから
 # 対局を始める。黒必勝の初期局面ばかりにならないようにするため。0 で無効
 opening_moves = 4
+# 互角の開局: opening_balance_games の割合の局で、ランダムな開局を opening_balance_simulations 回の探索 (ノイズなし)
+# で評価し、手番側から見た価値の絶対値が opening_balance 以下のものだけを使う (100 回試して見つからなければ最も互角に
+# 近いもの)。黒が 7 割以上勝つ開局ばかりだと勝敗から学べることが少ないため。
+# 互角の開局には通常の開局 (天元と白の 2 手目だけ) が入らないので、残りの局は今までどおりの開局にする。1.0 で無効
+opening_balance = 0.3
+opening_balance_simulations = 100
+opening_balance_games = 0.5
+# 探索のルートで VCF (四の連続での勝ち) を読み、自分の VCF は必ず打ち、相手に VCF を許す手は候補から外す。
+# 評価 (ゲーティング) にも同じ値を使う。人との対戦 (gomoku) では設定によらず有効 (--no-vcf で無効)
+vcf = true
 # playout cap randomization (KataGo): 各手をこの確率で通常の探索 (simulations 回、ノイズあり) にし、
 # それ以外は fast_simulations 回・ノイズなしの速い探索で打つ。学習データにするのは通常の探索をした局面だけ。1.0 で無効
 full_search_prob = 0.25
 fast_simulations = 100
 # 1 ファイルにまとめる局数
 games_per_file = 100
+
+[play]
+# 人と AI の対戦 (gomoku) の記録 (棋譜・各手の時間・AI の評価値と候補手) を 1 局 1 ファイルの JSON で書き出す先。
+# gomoku --no-record で書き出さない
+record_dir = "runs/games"
+# 勝ち負けがはっきりした局面 (評価値の絶対値が 0.8 超) で、負けているときは終局を遠ざける手、勝っているときは早く
+# 終わる手を選ぶ強さ。残り手数の差に応じて評価値に足す値の上限 (評価値が ±1 のとき)。0 で無効。
+# 負けの局面では評価がどの手も -1 近くに張り付き、粘る手を選ぶ理由がなくなるため。自己対局・評価には使わない
+moves_left_effect = 0.05
 
 [inference]
 # "cuda" または "cpu"
@@ -96,10 +115,12 @@ opening_moves = 4
 
 [gating]
 # 自己対局には最強モデル (model_dir/best.onnx) だけを使う。interval イテレーションごとに最新モデルと games 局
-# 打たせ、勝率が threshold 以上なら最強モデルを置き換える (400 局で 55% は偶然ではまず出ない差)
+# 打たせ、勝率が threshold 以上なら最強モデルを置き換える。
+# 0.50 は「弱くなっていなければ置き換える」。0.55 (偶然ではまず出ない差) だと最強モデルが入れ替わらず、
+# 自己対局のデータが同じ強さのまま学習が頭打ちになった (2026-10 の iter 1920〜2030)
 interval = 10
 games = 400
-threshold = 0.55
+threshold = 0.50
 # 強さの基準にする固定のモデル。最強モデルが入れ替わるたびに anchor_games 局打たせ、基準からの Elo を記録する。
 # なければ学習ループの開始時に最新モデルをここにコピーする
 anchor = "runs/models/anchor.onnx"

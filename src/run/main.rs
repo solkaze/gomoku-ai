@@ -7,14 +7,16 @@
 //! 端末では盤を色付きで描き、矢印キーかマウスで打つ (tui.rs)。--plain を付けるか、入出力が端末でなければ
 //! 座標を「x y」で入力する行単位の表示になる (plain.rs)。
 //! 座標は x が左から、y が上から、どちらも 0〜14 で、天元は 7 7。
+//! 対局の記録 (棋譜・各手の時間・AI の読み) は 1 局ごとに設定の play.record_dir へ JSON で書き出す (record.rs)。
 
 mod plain;
+mod record;
 mod tui;
 
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use clap::{Parser, ValueEnum};
 use gomoku_engine::config::{Config, Device, InferenceConfig};
@@ -86,7 +88,7 @@ const RULES_WARNING: &str = "AI は全ての禁じ手ありで学習している
 struct Args {
     #[arg(long, default_value = "config/config.toml")]
     config: PathBuf,
-    /// 使うモデル (省略時は model_dir/latest.onnx)
+    /// 使うモデル (省略時は model_dir/best.onnx。まだなければ latest.onnx)
     #[arg(long)]
     model: Option<PathBuf>,
     /// 人が持つ石 (省略時は起動後に尋ねる)
@@ -110,6 +112,12 @@ struct Args {
     /// 盤を色付きで描かず、座標を入力する行単位の表示にする
     #[arg(long)]
     plain: bool,
+    /// 対局の記録 (設定の play.record_dir) を書き出さない
+    #[arg(long)]
+    no_record: bool,
+    /// AI が VCF (四の連続での勝ち) を読まないようにする (比較用)
+    #[arg(long)]
+    no_vcf: bool,
 }
 
 /// 対局の形式
@@ -134,6 +142,8 @@ impl Mode {
 /// 対局の設定 (引数と設定ファイルから決まるもの)
 struct Setup {
     model_path: PathBuf,
+    /// 終わった対局の記録を書き出す先 (None なら書き出さない)
+    record_dir: Option<PathBuf>,
     inference: InferenceConfig,
     mcts: MctsConfig,
     /// 対局の形式 (None なら起動後に尋ねる)
@@ -193,12 +203,30 @@ fn top_candidates(result: &SearchResult, n: usize) -> Vec<(usize, f64)> {
     visits.into_iter().take(n).map(|(mv, n)| (mv, n as f64 * 100.0 / total.max(1) as f64)).collect()
 }
 
+/// AI が手を選んだときの読み (記録用)
+#[derive(Clone)]
+struct AiNote {
+    /// 手番側から見た評価値 [-1, 1]
+    value: f32,
+    /// 訪問回数の多い候補手と、その割合 (%)
+    candidates: Vec<(usize, f64)>,
+}
+
+/// 記録に残す候補手の数
+const NOTE_CANDIDATES: usize = 10;
+
 /// 棋譜と時間を残しながら進める対局。
 struct Game {
     board: Board,
     moves: Vec<usize>,
     /// 各手にかかった時間 (moves と同じ並び)
     times: Vec<Duration>,
+    /// AI が打った手の読み (moves と同じ並び。人の手は None)
+    notes: Vec<Option<AiNote>>,
+    /// 対局を始めた時刻 (記録用)
+    started_at: SystemTime,
+    /// 記録を書き出したファイル (同じ対局は同じファイルに上書きする)
+    record_file: Option<PathBuf>,
     started: Instant,
     /// 今の手番になった時刻
     turn_started: Instant,
@@ -209,7 +237,17 @@ struct Game {
 impl Game {
     fn new(rules: Rules) -> Self {
         let now = Instant::now();
-        Self { board: Board::with_rules(rules), moves: Vec::new(), times: Vec::new(), started: now, turn_started: now, finished: None }
+        Self {
+            board: Board::with_rules(rules),
+            moves: Vec::new(),
+            times: Vec::new(),
+            notes: Vec::new(),
+            started_at: SystemTime::now(),
+            record_file: None,
+            started: now,
+            turn_started: now,
+            finished: None,
+        }
     }
 
     /// 棋譜と、対局時間・各手にかかった秒数。
@@ -252,9 +290,20 @@ impl Game {
     }
 
     fn play(&mut self, p: usize) -> Result<GameResult, MoveError> {
+        self.play_noted(p, None)
+    }
+
+    /// AI が探索して選んだ手を打ち、その読みを記録に残す。
+    fn play_ai(&mut self, p: usize, result: &SearchResult) -> Result<GameResult, MoveError> {
+        let note = AiNote { value: result.value, candidates: top_candidates(result, NOTE_CANDIDATES) };
+        self.play_noted(p, Some(note))
+    }
+
+    fn play_noted(&mut self, p: usize, note: Option<AiNote>) -> Result<GameResult, MoveError> {
         let result = self.board.play(p)?;
         let now = Instant::now();
         self.moves.push(p);
+        self.notes.push(note);
         self.times.push(now - self.turn_started);
         self.turn_started = now;
         if result != GameResult::Ongoing {
@@ -275,6 +324,7 @@ impl Game {
         };
         self.moves.truncate(last);
         self.times.truncate(last);
+        self.notes.truncate(last);
         self.board = Board::with_rules(self.board.rules());
         for &p in &self.moves {
             self.board.play(p).expect("棋譜の手は合法手");
@@ -296,7 +346,7 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)?;
-    let model_path = args.model.unwrap_or_else(|| config.latest_model());
+    let model_path = args.model.unwrap_or_else(|| config.best_model());
     let mut inference = config.inference;
     if args.cpu {
         inference.device = Device::Cpu;
@@ -305,10 +355,18 @@ fn run() -> anyhow::Result<()> {
     for allowed in &args.allow {
         allowed.set(&mut rules, false);
     }
+    let record_dir = (!args.no_record).then_some(config.play.record_dir);
     let setup = Setup {
         model_path,
+        record_dir,
         inference,
-        mcts: MctsConfig { simulations: args.simulations, dirichlet_epsilon: 0.0, ..config.selfplay.mcts() },
+        mcts: MctsConfig {
+            simulations: args.simulations,
+            dirichlet_epsilon: 0.0,
+            vcf: !args.no_vcf,
+            moves_left_effect: config.play.moves_left_effect,
+            ..config.selfplay.mcts()
+        },
         mode: if args.free {
             Some(Mode::Free)
         } else {

@@ -122,3 +122,53 @@ fn search_speed() {
     let secs = start.elapsed().as_secs_f64();
     println!("{} moves, {sims} sims in {secs:.2}s = {:.0} sims/s", b.move_count(), sims as f64 / secs);
 }
+
+/// 指定した点の方策を高くし、価値は白の負けとする評価器
+struct LosingWhiteEvaluator {
+    focus: Vec<usize>,
+}
+
+impl Evaluator for LosingWhiteEvaluator {
+    fn evaluate(&mut self, boards: &[Board]) -> Vec<Evaluation> {
+        boards
+            .iter()
+            .map(|b| {
+                let mut policy = vec![0.0; crate::CELLS];
+                for &p in &self.focus {
+                    policy[p] = 8.0;
+                }
+                let value = if b.side_to_move() == Stone::White { -1.0 } else { 1.0 };
+                Evaluation { policy, value }
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn losing_side_prolongs_the_game() {
+    // 黒には活三が 2 つあり、白はどちらかしか止められない。白は (0,3) か (0,4) で四を打てば、黒に止めさせて
+    // 負けを 2 手遠ざけられる。評価はどの手も -1 なので、補正がなければ四を選ぶ理由がない
+    let b = board(
+        &[(7, 5), (7, 6), (7, 7), (9, 12), (10, 12), (11, 12)],
+        &[(0, 0), (0, 1), (0, 2)],
+        Stone::White,
+    );
+    let fours = [pos(0, 3), pos(0, 4)];
+    let mut focus = fours.to_vec();
+    focus.extend([(7, 3), (7, 4), (7, 8), (7, 9), (7, 12), (8, 12), (12, 12), (13, 12)].map(|(r, c)| pos(r, c)));
+    let run = |moves_left_effect| {
+        let config = MctsConfig { simulations: 4000, moves_left_effect, ..Default::default() };
+        let mut rng = StdRng::seed_from_u64(0);
+        Mcts::new(config).search(&b, &mut LosingWhiteEvaluator { focus: focus.clone() }, &mut rng)
+    };
+    let share = |result: &SearchResult| {
+        let total: u32 = result.visits.iter().map(|&(_, n)| n).sum();
+        let fours: u32 = result.visits.iter().filter(|(mv, _)| fours.contains(mv)).map(|&(_, n)| n).sum();
+        fours as f32 / total as f32
+    };
+
+    let plain = run(0.0);
+    let prolong = run(0.05);
+    assert!(fours.contains(&prolong.best_move()), "best = {}", prolong.best_move());
+    assert!(share(&prolong) > share(&plain) + 0.1, "share {} -> {}", share(&plain), share(&prolong));
+}

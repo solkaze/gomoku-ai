@@ -51,6 +51,52 @@ pub fn random_opening<R: Rng>(max_moves: usize, rng: &mut R) -> Board {
     }
 }
 
+/// 互角の開局の選び方。黒の先手が強く、ランダムな開局でも大半が黒勝ちになって勝敗から学べることが少ないので、
+/// 開局の局面を短い探索で評価し、手番側から見た価値の絶対値が max_value 以下のものだけを使う。
+/// 互角の開局には通常の開局 (天元と白の 2 手目だけ) がまず入らないので、games の割合の局だけに使い、
+/// 残りの局は random_opening をそのまま使う。
+#[derive(Clone, Copy, Debug)]
+pub struct OpeningBalance {
+    /// 受け入れる価値の絶対値の上限。1.0 以上で無効
+    pub max_value: f32,
+    /// 評価に使う探索回数 (ノイズなし)
+    pub simulations: u32,
+    /// 互角の開局を使う局の割合
+    pub games: f64,
+}
+
+impl OpeningBalance {
+    pub const OFF: Self = Self { max_value: 1.0, simulations: 0, games: 0.0 };
+}
+
+/// 互角の開局が見つからないときに諦めるまでの試行回数。諦めたら試した中で最も互角に近いものを使う。
+const BALANCE_TRIES: usize = 100;
+
+/// balance.games の確率で random_opening の局面のうち balance の条件を満たすものを、それ以外は random_opening を返す。
+pub fn balanced_opening<E: Evaluator, R: Rng>(
+    max_moves: usize,
+    balance: OpeningBalance,
+    mcts: &mut Mcts,
+    evaluator: &mut E,
+    rng: &mut R,
+) -> Board {
+    if balance.max_value >= 1.0 || !rng.random_bool(balance.games.clamp(0.0, 1.0)) {
+        return random_opening(max_moves, rng);
+    }
+    let mut closest: Option<(f32, Board)> = None;
+    for _ in 0..BALANCE_TRIES {
+        let board = random_opening(max_moves, rng);
+        let value = mcts.search_with(&board, evaluator, rng, balance.simulations, false).value.abs();
+        if value <= balance.max_value {
+            return board;
+        }
+        if closest.as_ref().is_none_or(|&(v, _)| value < v) {
+            closest = Some((value, board));
+        }
+    }
+    closest.expect("BALANCE_TRIES は 1 以上").1
+}
+
 /// 石の近くの空点。黒番では禁じ手を除く。
 fn opening_candidates(board: &Board) -> Vec<usize> {
     let stones: Vec<(usize, usize)> =

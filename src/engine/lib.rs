@@ -8,6 +8,8 @@ pub mod mcts;
 pub mod npz;
 pub mod rules;
 pub mod selfplay;
+pub mod vcf;
+pub mod vct;
 
 #[cfg(test)]
 mod tests;

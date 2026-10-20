@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>連珠 AI 対戦</title>
+<style>
+  :root {
+    --bg: #f4efe6;
+    --panel: #fffaf2;
+    --ink: #2b2620;
+    --muted: #7a6f62;
+    --line: #5a4630;
+    --wood: #e2b875;
+    --accent: #2f7d4f;
+    --danger: #c0392b;
+    --border: #d8ccb8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 16px;
+  }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 0.85rem; margin: 0 0 12px; }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  button {
+    font: inherit;
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--ink);
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.on { background: var(--ink); color: var(--panel); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .status {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    min-height: 3.4em;
+  }
+  .status .main { font-weight: 600; }
+  .status .detail { color: var(--muted); font-size: 0.9rem; margin-top: 2px; }
+  .status .warn { color: var(--danger); }
+  svg { display: block; width: 100%; height: auto; touch-action: manipulation; user-select: none; }
+  .board-wrap { position: relative; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(60, 40, 10, 0.18); }
+  .status.win { background: #e3f4e8; border-color: #8cc79f; }
+  .status.lose { background: #f9e3e0; border-color: #e0a199; }
+  .status.draw { background: #ecebe8; border-color: #c9c5bd; }
+  /* 終局の表示: 盤の上に大きく重ねる (「盤面を見る」で閉じる) */
+  .result {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(30, 22, 12, 0.45);
+    animation: fade-in 0.35s ease-out;
+  }
+  .result[hidden] { display: none; }
+  .result .card {
+    background: var(--panel);
+    border-radius: 14px;
+    padding: 24px 28px;
+    text-align: center;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    animation: pop 0.4s cubic-bezier(0.2, 1.4, 0.4, 1);
+    max-width: 85%;
+  }
+  .result .title { font-size: clamp(2.2rem, 9vw, 3.4rem); font-weight: 800; letter-spacing: 0.08em; line-height: 1.2; }
+  .result.win .title { color: #1f8a4c; }
+  .result.lose .title { color: #b3261e; }
+  .result.draw .title { color: #5f5a52; }
+  .result .reason { margin: 6px 0 16px; color: var(--muted); }
+  .result .buttons { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+  @keyframes fade-in { from { opacity: 0; } }
+  @keyframes pop { from { transform: scale(0.6); opacity: 0; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>連珠 AI 対戦</h1>
+  <p class="sub" id="info">モデルを確認しています…</p>
+
+  <div class="controls">
+    <span>あなたの石</span>
+    <div class="seg">
+      <button id="pick-black">黒 (先手)</button>
+      <button id="pick-white">白 (後手)</button>
+    </div>
+    <button id="new-game">新しい対局</button>
+  </div>
+
+  <div class="status">
+    <div class="main" id="status-main">「新しい対局」を押すと始まります</div>
+    <div class="detail" id="status-detail">黒の三三・四四・長連は禁じ手です。禁点は × で示し、打てません。</div>
+  </div>
+
+  <div class="board-wrap">
+    <svg id="board" viewBox="0 0 640 640" role="img" aria-label="盤面"></svg>
+    <div class="result" id="result" hidden>
+      <div class="card">
+        <div class="title" id="result-title"></div>
+        <div class="reason" id="result-reason"></div>
+        <div class="buttons">
+          <button class="primary" id="again">もう一局</button>
+          <button id="show-board">盤面を見る</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+const SIZE = 15, CENTER = 7 * SIZE + 7;
+const CELL = 40, MARGIN = 40;
+const STAR = [3, 7, 11];
+const NS = "http://www.w3.org/2000/svg";
+const STORAGE_KEY = "renju-web-game";
+// SVG の属性には CSS 変数を使わず、色を直接書く
+const WOOD = "#e2b875", LINE = "#5a4630", DANGER = "#c0392b", GOLD = "#f2b705";
+
+const state = {
+  human: "black",
+  moves: [],
+  result: null,          // null: 未開始, "ongoing" / "black" / "white" / "draw"
+  lostByForbidden: false,
+  toMove: "black",
+  forbidden: new Set(),
+  thinking: false,
+  thinkStart: 0,
+  winRate: null,
+  error: "",
+  resultClosed: false,   // 終局の表示を閉じたか
+};
+
+const $ = (id) => document.getElementById(id);
+const svg = $("board");
+const xy = (p) => [p % SIZE, Math.floor(p / SIZE)];
+const name = (c) => (c === "black" ? "黒" : "白");
+const other = (c) => (c === "black" ? "white" : "black");
+const aiColor = () => other(state.human);
+
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+// 盤の線・星・座標 (x は左から、y は上から 0〜14)
+function drawGrid() {
+  svg.innerHTML = "";
+  const defs = el("defs", {}, svg);
+  const gradients = { black: ["#555", "#111"], white: ["#fff", "#cfcac2"] };
+  for (const [id, [c1, c2]] of Object.entries(gradients)) {
+    const g = el("radialGradient", { id: "g-" + id, cx: "35%", cy: "35%", r: "65%" }, defs);
+    el("stop", { offset: "0%", "stop-color": c1 }, g);
+    el("stop", { offset: "100%", "stop-color": c2 }, g);
+  }
+  el("rect", { x: 0, y: 0, width: 640, height: 640, fill: WOOD }, svg);
+  const end = MARGIN + CELL * (SIZE - 1);
+  for (let i = 0; i < SIZE; i++) {
+    const v = MARGIN + CELL * i;
+    el("line", { x1: MARGIN, y1: v, x2: end, y2: v, stroke: LINE, "stroke-width": 1.2 }, svg);
+    el("line", { x1: v, y1: MARGIN, x2: v, y2: end, stroke: LINE, "stroke-width": 1.2 }, svg);
+    const label = { fill: LINE, "font-size": 14, "text-anchor": "middle", "dominant-baseline": "central" };
+    el("text", { ...label, x: v, y: MARGIN / 2 - 2 }, svg).textContent = i;
+    el("text", { ...label, x: MARGIN / 2 - 4, y: v }, svg).textContent = i;
+  }
+  for (const r of STAR) for (const c of STAR) {
+    el("circle", { cx: MARGIN + CELL * c, cy: MARGIN + CELL * r, r: 4, fill: LINE }, svg);
+  }
+  state.layer = el("g", {}, svg);
+}
+
+function render() {
+  const layer = state.layer;
+  layer.innerHTML = "";
+  const occupied = new Map();
+  state.moves.forEach((p, i) => occupied.set(p, i % 2 === 0 ? "black" : "white"));
+  const last = state.moves[state.moves.length - 1];
+  const humanTurn = canPlay();
+
+  for (let p = 0; p < SIZE * SIZE; p++) {
+    const [x, y] = xy(p);
+    const cx = MARGIN + CELL * x, cy = MARGIN + CELL * y;
+    const stone = occupied.get(p);
+    if (stone) {
+      el("circle", { cx, cy, r: 17.5, fill: `url(#g-${stone})`, stroke: stone === "white" ? "#9a9184" : "none", "stroke-width": 0.8 }, layer);
+      if (p === last) {
+        el("circle", { cx, cy, r: 5, fill: stone === "black" ? "#ff6b5b" : "#d63a2a" }, layer);
+      }
+      continue;
+    }
+    if (humanTurn && state.forbidden.has(p)) {
+      const d = 7;
+      for (const [a, b, c2, d2] of [[-d, -d, d, d], [-d, d, d, -d]]) {
+        el("line", { x1: cx + a, y1: cy + b, x2: cx + c2, y2: cy + d2, stroke: DANGER, "stroke-width": 3, "stroke-linecap": "round" }, layer);
+      }
+    }
+  }
+  // 終局: 五の石を金色の輪で囲む。黒の禁じ手で負けたときは、その石に × を重ねる
+  if (state.result === "black" || state.result === "white") {
+    if (state.lostByForbidden) {
+      const [x, y] = xy(last);
+      const cx = MARGIN + CELL * x, cy = MARGIN + CELL * y, d = 9;
+      for (const [a, b, c2, d2] of [[-d, -d, d, d], [-d, d, d, -d]]) {
+        el("line", { x1: cx + a, y1: cy + b, x2: cx + c2, y2: cy + d2, stroke: DANGER, "stroke-width": 4, "stroke-linecap": "round" }, layer);
+      }
+    } else {
+      for (const p of winningLine(occupied, last)) {
+        const [x, y] = xy(p);
+        el("circle", { cx: MARGIN + CELL * x, cy: MARGIN + CELL * y, r: 19.5, fill: "none", stroke: GOLD, "stroke-width": 4 }, layer);
+      }
+    }
+  }
+  // マウスを乗せた点に、打つ石を薄く描く
+  const ghost = el("circle", { r: 17.5, fill: `url(#g-${state.human})`, opacity: 0.45, visibility: "hidden", "pointer-events": "none" }, layer);
+  // タップの当たり判定 (石より上に置く)
+  for (let p = 0; p < SIZE * SIZE; p++) {
+    const [x, y] = xy(p);
+    const hit = el("rect", { x: MARGIN + CELL * x - CELL / 2, y: MARGIN + CELL * y - CELL / 2, width: CELL, height: CELL, fill: "transparent" }, layer);
+    hit.addEventListener("click", () => tap(p));
+    if (humanTurn && !occupied.has(p) && !state.forbidden.has(p)) {
+      hit.style.cursor = "pointer";
+      hit.addEventListener("mouseenter", () => {
+        ghost.setAttribute("cx", MARGIN + CELL * x);
+        ghost.setAttribute("cy", MARGIN + CELL * y);
+        ghost.setAttribute("visibility", "visible");
+      });
+      hit.addEventListener("mouseleave", () => ghost.setAttribute("visibility", "hidden"));
+    }
+  }
+  renderStatus();
+  renderResult();
+  $("pick-black").classList.toggle("on", state.human === "black");
+  $("pick-white").classList.toggle("on", state.human === "white");
+}
+
+function renderStatus() {
+  let main = "", detail = "";
+  const n = state.moves.length;
+  if (state.result === null) {
+    main = "「新しい対局」を押すと始まります";
+    detail = "黒の三三・四四・長連は禁じ手です。禁点は × で示し、打てません。";
+  } else if (state.result !== "ongoing") {
+    main = { win: "あなたの勝ちです", lose: "AI の勝ちです", draw: "引き分けです" }[outcome()];
+    detail = resultReason();
+  } else if (state.thinking) {
+    const secs = ((performance.now() - state.thinkStart) / 1000).toFixed(0);
+    main = `AI (${name(aiColor())}) が考えています… ${secs} 秒`;
+    detail = `${n} 手目まで`;
+  } else {
+    main = `あなた (${name(state.human)}) の番です`;
+    detail = `${n} 手目まで`;
+    if (state.winRate !== null) detail += `　AI の読み: AI の勝率 ${state.winRate.toFixed(1)}%`;
+  }
+  const warn = state.error;
+  const status = document.querySelector(".status");
+  for (const c of ["win", "lose", "draw"]) status.classList.toggle(c, state.result !== null && state.result !== "ongoing" && outcome() === c);
+  $("status-main").textContent = main;
+  $("status-detail").innerHTML = "";
+  $("status-detail").append(detail);
+  if (warn) {
+    const w = document.createElement("div");
+    w.className = "warn";
+    w.textContent = warn;
+    $("status-detail").append(w);
+  }
+}
+
+function canPlay() {
+  return state.result === "ongoing" && !state.thinking && state.toMove === state.human;
+}
+
+function tap(p) {
+  if (!canPlay() || state.moves.includes(p)) return;
+  if (state.forbidden.has(p)) {
+    state.error = "× は黒の禁点 (三三・四四・長連) なので打てません";
+    renderStatus();
+    return;
+  }
+  state.error = "";
+  send([...state.moves, p]);
+}
+
+// 人から見た結果: "win" / "lose" / "draw"
+function outcome() {
+  if (state.result === "draw") return "draw";
+  return state.result === state.human ? "win" : "lose";
+}
+
+function resultReason() {
+  const n = state.moves.length;
+  if (state.result === "draw") return `${n} 手で盤が埋まりました`;
+  const winner = state.result === state.human ? "あなた" : "AI";
+  if (state.lostByForbidden) return `黒の禁じ手で${winner} (白) の勝ち・${n} 手`;
+  return `${winner} (${name(state.result)}) が五をつくりました・${n} 手`;
+}
+
+// 最後の手を通る、同じ色が 5 つ以上並んだ列
+function winningLine(occupied, last) {
+  const color = occupied.get(last);
+  const [x0, y0] = xy(last);
+  for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [1, -1]]) {
+    const line = [last];
+    for (const sign of [1, -1]) {
+      let x = x0 + dx * sign, y = y0 + dy * sign;
+      while (x >= 0 && x < SIZE && y >= 0 && y < SIZE && occupied.get(y * SIZE + x) === color) {
+        line.push(y * SIZE + x);
+        x += dx * sign;
+        y += dy * sign;
+      }
+    }
+    if (line.length >= 5) return line;
+  }
+  return [];
+}
+
+function renderResult() {
+  const finished = state.result !== null && state.result !== "ongoing";
+  const box = $("result");
+  box.hidden = !finished || state.resultClosed;
+  if (box.hidden) return;
+  const kind = outcome();
+  box.className = "result " + kind;
+  $("result-title").textContent = { win: "勝ち！", lose: "負け…", draw: "引き分け" }[kind];
+  $("result-reason").textContent = resultReason();
+}
+
+async function send(moves) {
+  const before = { moves: state.moves, toMove: state.toMove, forbidden: state.forbidden };
+  // 打った石はすぐに描く
+  state.moves = moves;
+  state.thinking = true;
+  state.thinkStart = performance.now();
+  state.forbidden = new Set();
+  render();
+  const timer = setInterval(renderStatus, 1000);
+  try {
+    const res = await fetch("/api/move", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ moves, ai: aiColor() }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || res.statusText);
+    state.moves = body.moves;
+    state.result = body.result;
+    state.lostByForbidden = body.lost_by_forbidden;
+    state.toMove = body.to_move;
+    state.forbidden = new Set(body.forbidden);
+    if (body.ai_win_rate !== null) state.winRate = body.ai_win_rate;
+    save();
+  } catch (e) {
+    Object.assign(state, before);
+    // 対局を始められなかったときは未開始に戻す
+    if (before.moves.length === 0) state.result = null;
+    state.error = `打てませんでした: ${e.message}`;
+  } finally {
+    clearInterval(timer);
+    state.thinking = false;
+    render();
+  }
+}
+
+function newGame() {
+  if (state.thinking) return;
+  Object.assign(state, { moves: [], result: "ongoing", lostByForbidden: false, toMove: "black",
+    forbidden: new Set(), winRate: null, error: "", resultClosed: false });
+  // 空の棋譜を送ると、サーバーが黒の初手 (天元) を打ち、AI の番なら AI も打つ
+  send([]);
+}
+
+// 再読み込みしても対局を続けられるよう、このブラウザに棋譜を残す
+function save() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ human: state.human, moves: state.moves }));
+  } catch (_) { /* 保存できなくても対局はできる */ }
+}
+
+function restore() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+    if (saved && (saved.human === "black" || saved.human === "white") && Array.isArray(saved.moves) && saved.moves.length) {
+      state.human = saved.human;
+      state.result = "ongoing";
+      send(saved.moves);
+      return true;
+    }
+  } catch (_) { /* 読めなければ新しく始める */ }
+  return false;
+}
+
+$("pick-black").addEventListener("click", () => { if (!state.thinking) { state.human = "black"; render(); } });
+$("pick-white").addEventListener("click", () => { if (!state.thinking) { state.human = "white"; render(); } });
+$("new-game").addEventListener("click", newGame);
+$("again").addEventListener("click", newGame);
+$("show-board").addEventListener("click", () => { state.resultClosed = true; renderResult(); });
+
+fetch("/api/info").then((r) => r.json()).then((info) => {
+  $("info").textContent = `モデル ${info.model}・探索 ${info.simulations} 回/手 (${info.device})`;
+}).catch(() => { $("info").textContent = "サーバーに接続できません"; });
+
+drawGrid();
+if (!restore()) render();
+</script>
+</body>
+</html>

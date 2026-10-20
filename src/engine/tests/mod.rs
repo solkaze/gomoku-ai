@@ -4,6 +4,8 @@ mod config;
 mod mcts;
 mod selfplay;
 mod rules;
+mod vcf;
+mod vct;
 
 fn board(black: &[(usize, usize)], white: &[(usize, usize)], side: Stone) -> Board {
     let to_pos = |s: &[(usize, usize)]| s.iter().map(|&(r, c)| pos(r, c)).collect::<Vec<_>>();

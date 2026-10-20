@@ -6,7 +6,7 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use crate::mcts::MctsConfig;
-use crate::selfplay::PlayoutCap;
+use crate::selfplay::{OpeningBalance, PlayoutCap};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -14,6 +14,7 @@ pub struct Config {
     pub selfplay: SelfPlayConfig,
     pub evaluate: EvaluateConfig,
     pub inference: InferenceConfig,
+    pub play: PlayConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +36,13 @@ pub struct SelfPlayConfig {
     pub temperature_moves: usize,
     /// 開局でランダムに打つ手数の上限 (0 で無効)
     pub opening_moves: usize,
+    /// 互角の開局: opening_balance_games の割合の局で、開局の局面を opening_balance_simulations 回の探索で評価し、
+    /// 手番側から見た価値の絶対値がこれ以下のものだけを使う (selfplay::OpeningBalance)。1.0 で無効
+    pub opening_balance: f32,
+    pub opening_balance_simulations: u32,
+    pub opening_balance_games: f64,
+    /// 探索のルートで VCF を読む (mcts::MctsConfig::vcf)。評価 (evaluate) にも同じ値を使う
+    pub vcf: bool,
     /// playout cap randomization: 通常の探索 (simulations 回) をする手の割合。1.0 で無効
     pub full_search_prob: f64,
     /// それ以外の手の探索回数 (ノイズなし・学習データにしない)
@@ -47,6 +55,14 @@ impl SelfPlayConfig {
         PlayoutCap { full_prob: self.full_search_prob, fast_simulations: self.fast_simulations }
     }
 
+    pub fn opening_balance(&self) -> OpeningBalance {
+        OpeningBalance {
+            max_value: self.opening_balance,
+            simulations: self.opening_balance_simulations,
+            games: self.opening_balance_games,
+        }
+    }
+
     pub fn mcts(&self) -> MctsConfig {
         MctsConfig {
             simulations: self.simulations,
@@ -55,6 +71,8 @@ impl SelfPlayConfig {
             fpu_reduction: self.fpu_reduction,
             dirichlet_alpha: self.dirichlet_alpha,
             dirichlet_epsilon: self.dirichlet_epsilon,
+            vcf: self.vcf,
+            moves_left_effect: 0.0,
         }
     }
 }
@@ -73,6 +91,14 @@ impl EvaluateConfig {
     pub fn mcts(&self, selfplay: &SelfPlayConfig) -> MctsConfig {
         MctsConfig { simulations: self.simulations, dirichlet_epsilon: 0.0, ..selfplay.mcts() }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlayConfig {
+    /// 人と AI の対戦 (gomoku) の記録を書き出す先
+    pub record_dir: PathBuf,
+    /// 負けの局面で終局を遠ざけ、勝ちの局面で早く終わらせる強さ (mcts::MctsConfig::moves_left_effect)
+    pub moves_left_effect: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +134,7 @@ impl Config {
         let resolve = |p: &mut PathBuf| *p = root.join(&*p);
         resolve(&mut config.paths.selfplay_dir);
         resolve(&mut config.paths.model_dir);
+        resolve(&mut config.play.record_dir);
         resolve(&mut config.inference.onnxruntime_dir);
         config.inference.cuda_lib_dirs.iter_mut().for_each(resolve);
         Ok(config)
@@ -115,5 +142,11 @@ impl Config {
 
     pub fn latest_model(&self) -> PathBuf {
         self.paths.model_dir.join("latest.onnx")
+    }
+
+    /// 人との対戦に使うモデル: ゲーティングで選ばれた最強モデル (best.onnx)。まだなければ最新モデル。
+    pub fn best_model(&self) -> PathBuf {
+        let best = self.paths.model_dir.join("best.onnx");
+        if best.exists() { best } else { self.latest_model() }
     }
 }

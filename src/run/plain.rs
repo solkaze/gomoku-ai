@@ -6,7 +6,7 @@ use std::time::Instant;
 use gomoku_engine::inference::LoadStage;
 use gomoku_engine::{Board, CELLS, CENTER, GameResult, Rules, SIZE, SearchResult, Stone, pos};
 
-use crate::{Engine, Game, Mode, RULES_WARNING, Setup, clock, coord, forbidden_note, top_candidates};
+use crate::{Engine, Game, Mode, RULES_WARNING, Setup, clock, coord, forbidden_note, record, top_candidates};
 
 const HELP: &str = "\
   7 7 など    その点に打つ (x y の順。x は左から、y は上から、どちらも 0〜14)
@@ -134,7 +134,7 @@ pub fn run(setup: Setup) -> anyhow::Result<()> {
     println!("{HELP}\n");
 
     let mut game = Game::new(rules);
-    loop {
+    'game: loop {
         let side = game.board.side_to_move();
         let forbidden = (side == Stone::Black && mode.is_human(side)).then(|| game.board.forbidden_mask());
         println!("\n{}", render(&game.board, forbidden.as_ref()));
@@ -149,11 +149,11 @@ pub fn run(setup: Setup) -> anyhow::Result<()> {
                     Mode::Free => stone_name(winner),
                 };
                 println!("{name}の勝ちです{note}");
-                break;
+                break 'game;
             }
             GameResult::Draw => {
                 println!("引き分けです");
-                break;
+                break 'game;
             }
         }
 
@@ -164,7 +164,7 @@ pub fn run(setup: Setup) -> anyhow::Result<()> {
             let mv = result.best_move();
             println!("AI ({}): ({}) ({:.1} 秒)", stone_name(side), coord(mv), start.elapsed().as_secs_f64());
             print_analysis(&result, setup.candidates);
-            game.play(mv).expect("探索結果は合法手");
+            game.play_ai(mv, &result).expect("探索結果は合法手");
             continue;
         }
 
@@ -179,11 +179,11 @@ pub fn run(setup: Setup) -> anyhow::Result<()> {
             io::stdout().flush()?;
             let mut line = String::new();
             if stdin.read_line(&mut line)? == 0 {
-                return Ok(());
+                break 'game;
             }
             match line.trim() {
                 "" => continue,
-                "quit" | "exit" => return Ok(()),
+                "quit" | "exit" => break 'game,
                 "help" | "?" => println!("{HELP}"),
                 "undo" => {
                     if !game.undo(mode) {
@@ -218,6 +218,13 @@ pub fn run(setup: Setup) -> anyhow::Result<()> {
         }
     }
 
-    println!("\n{}", game.record());
+    if !game.moves.is_empty() {
+        println!("\n{}", game.record());
+    }
+    match record::save(&setup, mode, &mut game) {
+        Ok(Some(path)) => println!("記録を書き出しました: {}", path.display()),
+        Ok(None) => {}
+        Err(e) => println!("記録を書き出せませんでした: {e:#}"),
+    }
     Ok(())
 }

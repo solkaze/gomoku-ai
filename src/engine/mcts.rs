@@ -9,6 +9,7 @@ use rand::Rng;
 use rand_distr::{Distribution, Gamma};
 
 use crate::board::{Board, CELLS, GameResult, Stone};
+use crate::vcf;
 
 /// ネットワークによる局面評価の結果。
 pub struct Evaluation {
@@ -44,7 +45,22 @@ pub struct MctsConfig {
     pub dirichlet_alpha: f32,
     /// ルートの事前確率に混ぜるノイズの割合。0 で無効(対戦時)。
     pub dirichlet_epsilon: f32,
+    /// ルートで VCF (四の連続での勝ち) を読む。自分に VCF があればその手だけを、なければ相手に VCF を許さない
+    /// 手だけを候補にする (全ての手が許すなら絞らない)。
+    pub vcf: bool,
+    /// 勝ち負けがはっきりした局面 (|Q| が MOVES_LEFT_THRESHOLD を超える) で、負けているときは終局を遠ざける手、
+    /// 勝っているときは早く終わる手を選ぶ強さ。残り手数の差に応じて Q に足す値の上限。0 で無効。
+    /// 負けの局面では評価がどの手も -1 近くに張り付き、粘る手を選ぶ理由がなくなるため (対戦用)。
+    pub moves_left_effect: f32,
 }
+
+/// 残り手数による補正をかけ始める |Q|。これを超えた分に比例して強くし、|Q| = 1 で moves_left_effect まで
+const MOVES_LEFT_THRESHOLD: f32 = 0.8;
+/// 残り手数 1 手の差あたりの補正
+const MOVES_LEFT_SLOPE: f32 = 0.005;
+/// ネットワークで評価した葉から終局までの手数の見積もり (終局の葉は 0)。
+/// 読み切れていない手順を、読み切った手順より長いものとして扱う
+const UNKNOWN_MOVES_LEFT: f32 = 10.0;
 
 impl Default for MctsConfig {
     fn default() -> Self {
@@ -55,6 +71,8 @@ impl Default for MctsConfig {
             fpu_reduction: 0.2,
             dirichlet_alpha: 0.03,
             dirichlet_epsilon: 0.0,
+            vcf: false,
+            moves_left_effect: 0.0,
         }
     }
 }
@@ -75,6 +93,8 @@ struct Node {
     visits: u32,
     /// この手を打った側から見た価値の合計
     value_sum: f32,
+    /// この手の後の局面から終局までの手数の見積もりの合計
+    moves_left_sum: f32,
     virtual_loss: u32,
     first_child: usize,
     num_children: usize,
@@ -88,6 +108,7 @@ impl Node {
             prior,
             visits: 0,
             value_sum: 0.0,
+            moves_left_sum: 0.0,
             virtual_loss: 0,
             first_child: 0,
             num_children: 0,
@@ -138,6 +159,18 @@ impl SearchResult {
         }
         policy
     }
+}
+
+/// ルートの候補手を VCF の読みで絞る。自分に VCF があればその最初の手だけ、なければ相手に VCF を許さない手だけ。
+fn vcf_root_moves(board: &Board, moves: Vec<usize>) -> Vec<usize> {
+    if moves.len() <= 1 {
+        return moves;
+    }
+    if let Some(line) = vcf::find(board, vcf::DEFAULT_BUDGET) {
+        return vec![line[0]];
+    }
+    let safe = vcf::safe_moves(board, &moves, vcf::DEFAULT_BUDGET);
+    if safe.is_empty() { moves } else { safe }
 }
 
 /// 探索する手の候補。即勝ちがあればその 1 手、相手の五を止める必要があれば止める手だけに絞る。
@@ -225,7 +258,11 @@ impl Mcts {
         self.nodes.push(Node::new(usize::MAX, 1.0));
 
         let eval = evaluator.evaluate(std::slice::from_ref(root)).pop().expect("評価結果がない");
-        self.expand(ROOT, root, &eval.policy);
+        let mut moves = candidate_moves(root);
+        if self.config.vcf {
+            moves = vcf_root_moves(root, moves);
+        }
+        self.expand_moves(ROOT, &moves, &eval.policy);
         if root_noise {
             self.add_root_noise(rng);
         }
@@ -240,7 +277,7 @@ impl Mcts {
                 let leaf = *path.last().unwrap();
                 match self.nodes[leaf].state {
                     NodeState::Terminal(v) => {
-                        self.backup(&path, v);
+                        self.backup(&path, v, 0.0);
                         done += 1;
                     }
                     NodeState::Pending => {
@@ -263,7 +300,7 @@ impl Mcts {
             for ((path, board), eval) in paths.iter().zip(&boards).zip(&evals) {
                 self.expand(*path.last().unwrap(), board, &eval.policy);
                 // eval.value は葉の手番側から見た値なので、葉に打った側からは反転する
-                self.backup(path, -eval.value);
+                self.backup(path, -eval.value, UNKNOWN_MOVES_LEFT);
                 done += 1;
             }
         }
@@ -314,6 +351,7 @@ impl Mcts {
         // 親の value_sum は親に打った側の視点なので、子を選ぶ側の視点では反転する
         let parent_q = if parent.visits > 0 { -parent.value_sum / parent.visits as f32 } else { 0.0 };
         let fpu = parent_q - self.config.fpu_reduction;
+        let moves_left = self.moves_left_bonus(parent, parent_q);
 
         let score = |c: usize| {
             let child = &self.nodes[c];
@@ -324,15 +362,39 @@ impl Mcts {
                 // 仮想損失は訪問 1 回・価値 -1 として扱う
                 (child.value_sum - child.virtual_loss as f32) / n as f32
             };
-            q + self.config.c_puct * child.prior * sqrt_n / (1 + n) as f32
+            q + moves_left(child) + self.config.c_puct * child.prior * sqrt_n / (1 + n) as f32
         };
         self.children(id)
             .max_by(|&a, &b| score(a).total_cmp(&score(b)))
             .expect("展開済みノードに子がない")
     }
 
+    /// 子を選ぶ側から見た Q が parent_q のとき、子の残り手数に応じて Q に足す値。負けていれば親の見積もりより
+    /// 長い子、勝っていれば短い子ほど大きい。未訪問の子は 0。
+    fn moves_left_bonus(&self, parent: &Node, parent_q: f32) -> impl Fn(&Node) -> f32 {
+        let effect = self.config.moves_left_effect;
+        let strength = if effect > 0.0 && parent.visits > 0 {
+            ((parent_q.abs() - MOVES_LEFT_THRESHOLD) / (1.0 - MOVES_LEFT_THRESHOLD)).max(0.0)
+        } else {
+            0.0
+        };
+        // 親の局面から終局までの手数から、子の手の 1 手を引いたもの
+        let expected = parent.moves_left_sum / parent.visits.max(1) as f32 - 1.0;
+        let sign = if parent_q < 0.0 { 1.0 } else { -1.0 };
+        move |child: &Node| {
+            if strength == 0.0 || child.visits == 0 {
+                return 0.0;
+            }
+            let diff = child.moves_left_sum / child.visits as f32 - expected;
+            sign * strength * (MOVES_LEFT_SLOPE * diff).clamp(-effect, effect)
+        }
+    }
+
     fn expand(&mut self, id: usize, board: &Board, logits: &[f32]) {
-        let moves = candidate_moves(board);
+        self.expand_moves(id, &candidate_moves(board), logits);
+    }
+
+    fn expand_moves(&mut self, id: usize, moves: &[usize], logits: &[f32]) {
         let max = moves.iter().map(|&m| logits[m]).fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = moves.iter().map(|&m| (logits[m] - max).exp()).collect();
         let total: f32 = exps.iter().sum();
@@ -359,14 +421,17 @@ impl Mcts {
         }
     }
 
-    /// 葉から根へ価値を伝播し、仮想損失を取り除く。value は葉に打った側から見た値。
-    fn backup(&mut self, path: &[usize], mut value: f32) {
+    /// 葉から根へ価値を伝播し、仮想損失を取り除く。value は葉に打った側から見た値、moves_left は葉の局面から
+    /// 終局までの手数の見積もり。
+    fn backup(&mut self, path: &[usize], mut value: f32, mut moves_left: f32) {
         for &id in path.iter().rev() {
             let node = &mut self.nodes[id];
             node.visits += 1;
             node.value_sum += value;
+            node.moves_left_sum += moves_left;
             node.virtual_loss -= 1;
             value = -value;
+            moves_left += 1.0;
         }
     }
 

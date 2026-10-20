@@ -16,7 +16,7 @@ use gomoku_engine::config::Config;
 use gomoku_engine::features::{FEATURE_LEN, PLANES};
 use gomoku_engine::inference::{self, InferenceServer};
 use gomoku_engine::npz::{NpyArray, NpyData, write_npz};
-use gomoku_engine::selfplay::{Game, play_game, random_opening};
+use gomoku_engine::selfplay::{Game, balanced_opening, play_game};
 use gomoku_engine::{CELLS, GameResult, Mcts, SIZE, Stone};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -60,10 +60,11 @@ fn run() -> anyhow::Result<()> {
             let next_game = Arc::clone(&next_game);
             let mut mcts = Mcts::new(sp.mcts());
             let (temperature_moves, opening_moves, cap) = (sp.temperature_moves, sp.opening_moves, sp.playout_cap());
+            let balance = sp.opening_balance();
             thread::spawn(move || {
                 let mut rng = StdRng::from_os_rng();
                 while next_game.fetch_add(1, Ordering::Relaxed) < games {
-                    let opening = random_opening(opening_moves, &mut rng);
+                    let opening = balanced_opening(opening_moves, balance, &mut mcts, &mut evaluator, &mut rng);
                     let game = play_game(&mut mcts, &mut evaluator, &opening, temperature_moves, cap, &mut rng);
                     if tx.send(game).is_err() {
                         break;

@@ -1,4 +1,4 @@
-# base: 開発用 (devcontainer)。train: 学習用 (依存とバイナリを焼き込んだイメージ)
+# base: 開発用 (devcontainer)。train: 学習用 (依存とバイナリを焼き込んだイメージ)。web: ブラウザで対戦するサーバー
 FROM ubuntu:26.04 AS base
 
 # Set environment variables to avoid interactive prompts
@@ -49,3 +49,9 @@ ENV HOME=/tmp \
     LOGNAME=gomoku \
     UV_CACHE_DIR=/tmp/uv-cache
 CMD ["uv", "run", "--no-sync", "src/train/main.py", "loop"]
+
+
+FROM train AS web
+
+# コンテナ内では全てのインターフェースで待ち受け、公開範囲は compose の ports で絞る
+CMD ["target/release/web", "--addr", "0.0.0.0:39115"]

@@ -75,20 +75,20 @@ pub fn is_five(cells: &Cells, p: usize, color: u8, rules: Rules) -> bool {
     DIRS.iter().any(|&d| rules.is_win(color, run_len(cells, p, d, color)))
 }
 
-/// 黒石が置かれた p について、方向 d 上で「p を含む五」を完成させる空点。
+/// color の石が置かれた p について、方向 d 上で「p を含む五」を完成させる空点。
 /// (個数, 最小オフセット, 最大オフセット) を返す。
-fn five_points(cells: &mut Cells, p: usize, d: (isize, isize), rules: Rules) -> (u32, isize, isize) {
+fn five_points(cells: &mut Cells, p: usize, d: (isize, isize), color: u8, rules: Rules) -> (u32, isize, isize) {
     let (mut n, mut min, mut max) = (0, isize::MAX, isize::MIN);
     for k in (-4..=4).filter(|&k| k != 0) {
         let Some(q) = step(p, d, k) else { continue };
         if cells[q] != EMPTY {
             continue;
         }
-        cells[q] = BLACK;
-        let (lo, hi) = run(cells, q, d, BLACK);
+        cells[q] = color;
+        let (lo, hi) = run(cells, q, d, color);
         cells[q] = EMPTY;
         // q から見た p の位置は -k
-        if rules.is_win(BLACK, hi - lo + 1) && lo <= -k && -k <= hi {
+        if rules.is_win(color, hi - lo + 1) && lo <= -k && -k <= hi {
             n += 1;
             min = min.min(k);
             max = max.max(k);
@@ -100,30 +100,35 @@ fn five_points(cells: &mut Cells, p: usize, d: (isize, isize), rules: Rules) -> 
 /// 方向 d 上で p が作っている四の数。達四(・●●●●・)は 1 つと数え、
 /// ●・●●●・● のような一直線の四四は 2 つと数える。
 fn four_count(cells: &mut Cells, p: usize, d: (isize, isize), rules: Rules) -> u32 {
-    match five_points(cells, p, d, rules) {
+    match five_points(cells, p, d, BLACK, rules) {
         (2, min, max) if max - min == 5 => 1,
         (n, _, _) => n,
     }
 }
 
-/// 方向 d 上で p が本物の三を作っているか:
-/// p を含む達四を作れる空点があり、その点が禁じ手でないこと。
-fn is_true_three(cells: &mut Cells, p: usize, d: (isize, isize), rules: Rules) -> bool {
+/// 方向 d 上で、color の石が置かれた p が本物の三を作っているか:
+/// p を含む達四を作れる空点があり、黒ならその点が禁じ手でないこと。
+fn is_true_three(cells: &mut Cells, p: usize, d: (isize, isize), color: u8, rules: Rules) -> bool {
     for k in (-4..=4).filter(|&k| k != 0) {
         let Some(q) = step(p, d, k) else { continue };
         if cells[q] != EMPTY {
             continue;
         }
-        cells[q] = BLACK;
-        let (n, min, max) = five_points(cells, q, d, rules);
+        cells[q] = color;
+        let (n, min, max) = five_points(cells, q, d, color, rules);
         cells[q] = EMPTY;
         // 達四の両端の間に p があれば、その達四は p を含む
         let straight_four_with_p = n == 2 && max - min == 5 && min < -k && -k < max;
-        if straight_four_with_p && !is_forbidden(cells, q, rules) {
+        if straight_four_with_p && (color != BLACK || !is_forbidden(cells, q, rules)) {
             return true;
         }
     }
     false
+}
+
+/// color の石が置かれた p が、どれかの方向で本物の三を作っているか。
+pub fn is_three(cells: &mut Cells, p: usize, color: u8, rules: Rules) -> bool {
+    DIRS.iter().any(|&d| is_true_three(cells, p, d, color, rules))
 }
 
 /// 空点 p に黒が打つと禁じ手になるか。cells は判定中に一時的に書き換えるが、戻り値の時点で元に戻っている。
@@ -162,7 +167,7 @@ fn forbidden_with_stone(cells: &mut Cells, p: usize, rules: Rules) -> bool {
         let f = four_count(cells, p, d, rules);
         if f > 0 {
             fours += f;
-        } else if rules.double_three && is_true_three(cells, p, d, rules) {
+        } else if rules.double_three && is_true_three(cells, p, d, BLACK, rules) {
             threes += 1;
         }
         if (rules.double_four && fours >= 2) || threes >= 2 {

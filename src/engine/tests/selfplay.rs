@@ -4,7 +4,7 @@ use rand::rngs::StdRng;
 use super::board;
 use crate::features::{FEATURE_LEN, encode};
 use crate::npz::{NpyArray, NpyData, write_npz};
-use crate::selfplay::{PlayoutCap, play_game, random_opening};
+use crate::selfplay::{OpeningBalance, PlayoutCap, balanced_opening, play_game, random_opening};
 use crate::{Board, CELLS, CENTER, GameResult, Mcts, MctsConfig, Stone, UniformEvaluator, pos};
 
 fn plane(features: &[u8], i: usize) -> &[u8] {
@@ -124,6 +124,39 @@ fn random_opening_plays_up_to_max_moves_near_the_stones() {
         }
     }
     assert!(seen.iter().all(|&s| s));
+}
+
+#[test]
+fn balanced_opening_keeps_only_openings_searched_as_even() {
+    // 石が limit 個以下の局面は互角 (価値 0)、それより多い局面は一方的 (0.9) と評価する
+    struct ByStones(usize);
+    impl crate::Evaluator for ByStones {
+        fn evaluate(&mut self, boards: &[Board]) -> Vec<crate::Evaluation> {
+            let value = |b: &Board| if b.move_count() <= self.0 { 0.0 } else { 0.9 };
+            boards.iter().map(|b| crate::Evaluation { policy: vec![0.0; CELLS], value: value(b) }).collect()
+        }
+    }
+    let mut rng = StdRng::seed_from_u64(2);
+    // 1 回の探索では葉 (開局 + 1 手) を 1 つだけ評価するので、開局の石が 2 個以下なら互角になる
+    let mut mcts = Mcts::new(MctsConfig { simulations: 1, ..Default::default() });
+    let balance = OpeningBalance { max_value: 0.5, simulations: 1, games: 1.0 };
+    for _ in 0..50 {
+        assert!(balanced_opening(4, balance, &mut mcts, &mut ByStones(3), &mut rng).move_count() <= 2);
+    }
+    // 無効なら評価せずにランダムな開局をそのまま使う
+    let counts: Vec<usize> = (0..50)
+        .map(|_| balanced_opening(4, OpeningBalance::OFF, &mut mcts, &mut ByStones(3), &mut rng).move_count())
+        .collect();
+    assert!(counts.iter().any(|&n| n > 2));
+    // games の割合の局だけ互角の開局にする
+    let half = OpeningBalance { games: 0.5, ..balance };
+    let uneven = (0..200)
+        .filter(|_| balanced_opening(4, half, &mut mcts, &mut ByStones(3), &mut rng).move_count() > 2)
+        .count();
+    // 互角でない開局 (石が 3 個以上) は random_opening の約 6 割なので、半分の局では約 60 局
+    assert!((30..=90).contains(&uneven), "{uneven}");
+    // 互角の開局が見つからなくても、試した中から返す
+    assert_eq!(balanced_opening(4, balance, &mut mcts, &mut ByStones(0), &mut rng).result(), GameResult::Ongoing);
 }
 
 #[test]

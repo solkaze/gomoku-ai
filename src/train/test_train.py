@@ -184,7 +184,7 @@ def small_config(tmp_path: Path) -> Config:
         paths=paths,
         model=ModelConfig(channels=8, blocks=1),
         train=replace(config.train, device="cpu", export_fp16=False),
-        gating=replace(config.gating, anchor=paths.model_dir / "anchor.onnx"),
+        gating=replace(config.gating, anchor=paths.model_dir / "anchor.onnx", threshold=0.55),
     )
 
 
