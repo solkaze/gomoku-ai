@@ -15,10 +15,12 @@ from tqdm import tqdm
 
 from config import Config, ModelConfig
 from export import export_onnx
-from network import PolicyValueNet, loss_fn
+from network import BASE_IN_CHANNELS, IN_CHANNELS, PolicyValueNet, loss_fn
 from replay import ReplayBuffer
 
 LATEST_CHECKPOINT = "latest.pt"
+# 入力の畳み込みの重み (入力平面数を広げるときに使う)
+STEM_WEIGHT = "stem.0.weight"
 LATEST_MODEL = "latest.onnx"
 ITER_PATTERN = re.compile(r"iter_(\d+)")
 
@@ -67,6 +69,39 @@ def model_channels(model: PolicyValueNet) -> int:
     return model.stem[0].out_channels
 
 
+def model_in_channels(model: PolicyValueNet) -> int:
+    return model.stem[0].in_channels
+
+
+def widen_input(data: dict) -> None:
+    """VCF の平面を加える前 (入力 BASE_IN_CHANNELS 平面) のチェックポイント data を IN_CHANNELS 平面に広げる。
+    増えた入力の重みは 0 にするので、広げた直後の出力は元のモデルと変わらない。optimizer の状態も同じ形に広げる。"""
+    in_channels = data.get("in_channels", BASE_IN_CHANNELS)
+    if in_channels == IN_CHANNELS:
+        return
+    old = data["model"][STEM_WEIGHT]
+
+    def pad(t: torch.Tensor) -> torch.Tensor:
+        return torch.cat([t, t.new_zeros(t.shape[0], IN_CHANNELS - t.shape[1], *t.shape[2:])], dim=1)
+
+    data["model"][STEM_WEIGHT] = pad(old)
+    # 入力の畳み込みの Adam の moment は、重みと同じ形をしている (この形の引数はほかにない)
+    for param_state in data.get("optimizer", {}).get("state", {}).values():
+        for key, value in param_state.items():
+            if isinstance(value, torch.Tensor) and value.shape == old.shape:
+                param_state[key] = pad(value)
+    data["in_channels"] = IN_CHANNELS
+    print(f"入力平面を {in_channels} から {IN_CHANNELS} に増やしました (増えた入力の重みは 0 から学習します)")
+
+
+def model_from_checkpoint(data: dict, device: torch.device) -> PolicyValueNet:
+    """チェックポイントのモデルを、構造をチェックポイントに合わせて作る。入力平面が少ない古いものは広げる。"""
+    widen_input(data)
+    model = PolicyValueNet.from_config(ModelConfig(**data["model_config"])).to(device)
+    model.load_state_dict(data["model"])
+    return model
+
+
 def export_latest(config: Config, model: PolicyValueNet, iteration: int) -> Path:
     onnx = model_path(config, iteration)
     export_onnx(model, onnx, fp16=config.train.export_fp16)
@@ -85,6 +120,7 @@ def save(config: Config, state: TrainState) -> None:
             "step": state.step,
             "trained_until": state.trained_until,
             "model_config": {"channels": model_channels(state.model), "blocks": len(state.model.trunk)},
+            "in_channels": model_in_channels(state.model),
             "model": state.model.state_dict(),
             "optimizer": state.optimizer.state_dict(),
         },
@@ -110,8 +146,7 @@ def load(config: Config, device: torch.device) -> TrainState:
     model_config = ModelConfig(**data["model_config"])
     if model_config != config.model:
         print(f"注意: 設定 {config.model} ではなくチェックポイントの {model_config} を使います")
-    model = PolicyValueNet.from_config(model_config).to(device)
-    model.load_state_dict(data["model"])
+    model = model_from_checkpoint(data, device)
     optimizer = make_optimizer(model, config)
     optimizer.load_state_dict(data["optimizer"])
     return TrainState(
@@ -139,8 +174,7 @@ def adopt(config: Config, path: Path) -> int:
 
     学習率スケジュールの累計ステップ数は 0 から数え直し、今ある自己対局データは学習済みとして扱う。"""
     data = torch.load(path, map_location="cpu", weights_only=True)
-    model = PolicyValueNet.from_config(ModelConfig(**data["model_config"]))
-    model.load_state_dict(data["model"])
+    model = model_from_checkpoint(data, torch.device("cpu"))
     optimizer = make_optimizer(model, config)
     optimizer.load_state_dict(data["optimizer"])
 

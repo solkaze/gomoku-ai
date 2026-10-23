@@ -322,10 +322,12 @@ fn load_selfplay(dir: &Path, files: usize) -> anyhow::Result<Vec<Position>> {
             read_npy(path, "policy")?.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         let value: Vec<f32> =
             read_npy(path, "value")?.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        if states.len() != value.len() * PLANES * CELLS || policy.len() != value.len() * CELLS {
+        // 平面数はファイルによって違う (VCF の平面を加える前のデータは BASE_PLANES)。使うのは 0〜2 だけ
+        let planes = if value.is_empty() { PLANES } else { states.len() / (value.len() * CELLS) };
+        if states.len() != value.len() * planes * CELLS || planes < 3 || policy.len() != value.len() * CELLS {
             bail!("{} の配列の大きさが合いません", path.display());
         }
-        for (i, features) in states.chunks_exact(PLANES * CELLS).enumerate() {
+        for (i, features) in states.chunks_exact(planes * CELLS).enumerate() {
             // 特徴平面 (features.rs): 0 手番側の石 / 1 相手の石 / 2 手番が黒なら 1
             let side = if features[2 * CELLS] == 1 { Stone::Black } else { Stone::White };
             let own: Vec<usize> = (0..CELLS).filter(|&p| features[p] == 1).collect();

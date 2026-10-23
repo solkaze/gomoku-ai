@@ -2,7 +2,9 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use super::board;
-use crate::features::{FEATURE_LEN, encode};
+use super::vcf::after;
+use crate::features::{BASE_PLANES, FEATURE_LEN, VCF_BUDGET, encode};
+use crate::vcf;
 use crate::npz::{NpyArray, NpyData, write_npz};
 use crate::selfplay::{OpeningBalance, PlayoutCap, balanced_opening, play_game, random_opening};
 use crate::{Board, CELLS, CENTER, GameResult, Mcts, MctsConfig, Stone, UniformEvaluator, pos};
@@ -30,6 +32,44 @@ fn features_are_relative_to_side_to_move() {
     assert_eq!(plane(&f, 1)[pos(7, 5)], 1);
     assert!(plane(&f, 2).iter().all(|&x| x == 0));
     assert_eq!(plane(&f, 3)[pos(7, 7)], 1);
+}
+
+#[test]
+fn vcf_planes_mark_the_attacking_moves_of_each_side() {
+    // VCF の攻め手 (手順の偶数番目) の点だけが 1 の平面
+    let attacks = |b: &Board| {
+        let mut plane = vec![0u8; CELLS];
+        for p in vcf::find(b, VCF_BUDGET).unwrap_or_default().into_iter().step_by(2) {
+            plane[p] = 1;
+        }
+        plane
+    };
+    // 41 手目 (黒番): 黒に VCF がある
+    let board = after(40);
+    let mut passed = board.clone();
+    passed.pass();
+    let black_vcf = attacks(&board);
+    assert!(black_vcf.contains(&1));
+
+    let mut f = vec![0; FEATURE_LEN];
+    encode(&board, &mut f);
+    assert_eq!(plane(&f, 4), black_vcf);
+    assert_eq!(plane(&f, 5), attacks(&passed));
+
+    // 黒が一手休んだ局面 (白番) では、黒の VCF は相手の平面に出る
+    encode(&passed, &mut f);
+    assert_eq!(plane(&f, 4), attacks(&passed));
+    assert_eq!(plane(&f, 5), black_vcf);
+}
+
+#[test]
+fn base_planes_are_the_first_planes_of_the_full_features() {
+    let board = after(40);
+    let mut full = vec![0; FEATURE_LEN];
+    let mut base = vec![0; BASE_PLANES * CELLS];
+    encode(&board, &mut full);
+    encode(&board, &mut base);
+    assert_eq!(base, full[..BASE_PLANES * CELLS]);
 }
 
 #[test]

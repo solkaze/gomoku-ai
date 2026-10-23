@@ -17,7 +17,7 @@ use ort::value::Tensor;
 
 use crate::board::{Board, CELLS, SIZE};
 use crate::config::{Device, InferenceConfig};
-use crate::features::{FEATURE_LEN, PLANES, encode};
+use crate::features::{BASE_PLANES, PLANES, encode};
 use crate::mcts::{Evaluation, Evaluator};
 
 /// CUDA 実行プロバイダが使うライブラリ。依存される側から順に読み込む。
@@ -161,6 +161,8 @@ const BATCH_ALIGN: usize = 32;
 
 pub struct OnnxModel {
     session: Session,
+    /// モデルの入力平面数 (features::PLANES か、VCF の平面を加える前のモデルなら BASE_PLANES)
+    planes: usize,
 }
 
 impl OnnxModel {
@@ -178,10 +180,11 @@ impl OnnxModel {
                 .map_err(|e| anyhow::anyhow!("CUDA を有効にできません: {e}"))?;
         }
         let session = builder.commit_from_file(path).with_context(|| format!("{} を読み込めません", path.display()))?;
-        let mut model = Self { session };
+        let planes = input_planes(&session).with_context(|| format!("{} の入力の形を読めません", path.display()))?;
+        let mut model = Self { session, planes };
         on_stage(LoadStage::Warmup);
         // GPU で実際に動くかは推論してみるまで分からない (例: GPU の世代向けのカーネルがない) ので、ここで一度試す
-        model.run(&[0; FEATURE_LEN]).with_context(|| {
+        model.run(&vec![0; model.feature_len()]).with_context(|| {
             format!(
                 "{device:?} での試し推論に失敗しました。onnxruntime の CUDA 版がこの GPU の世代 \
                  (compute capability) に対応していない可能性があります"
@@ -190,14 +193,20 @@ impl OnnxModel {
         Ok(model)
     }
 
-    /// features は n 局面分の特徴平面 (n * FEATURE_LEN)。
+    /// 1 局面分の特徴の長さ (入力平面数 × CELLS)。
+    pub fn feature_len(&self) -> usize {
+        self.planes * CELLS
+    }
+
+    /// features は n 局面分の特徴平面 (n * feature_len)。
     pub fn run(&mut self, features: &[u8]) -> anyhow::Result<Vec<Evaluation>> {
-        let n = features.len() / FEATURE_LEN;
+        let feature_len = self.feature_len();
+        let n = features.len() / feature_len;
         // cuDNN は入力の形ごとに畳み込みアルゴリズムを探索し直すので、バッチを BATCH_ALIGN の倍数に揃えて形の種類を減らす
         let padded = n.max(1).next_multiple_of(BATCH_ALIGN);
         let mut input: Vec<f32> = features.iter().map(|&x| x as f32).collect();
-        input.resize(padded * FEATURE_LEN, 0.0);
-        let input = Tensor::from_array(([padded, PLANES, SIZE, SIZE], input))?;
+        input.resize(padded * feature_len, 0.0);
+        let input = Tensor::from_array(([padded, self.planes, SIZE, SIZE], input))?;
         let outputs = self.session.run(ort::inputs!["input" => input])?;
         let (_, policy) = outputs["policy"].try_extract_tensor::<f32>()?;
         let (_, value) = outputs["value"].try_extract_tensor::<f32>()?;
@@ -207,17 +216,45 @@ impl OnnxModel {
     }
 }
 
-fn encode_all(boards: &[Board]) -> Vec<u8> {
-    let mut features = vec![0; boards.len() * FEATURE_LEN];
-    for (board, out) in boards.iter().zip(features.chunks_exact_mut(FEATURE_LEN)) {
+/// ONNX の入力 "input" [batch, planes, 15, 15] の planes。対応している平面数でなければエラー。
+fn input_planes(session: &Session) -> anyhow::Result<usize> {
+    let input = session.inputs().first().context("入力がありません")?;
+    let shape = input.dtype().tensor_shape().context("入力がテンソルではありません")?;
+    let planes = usize::try_from(*shape.get(1).context("入力の次元が足りません")?).unwrap_or(0);
+    anyhow::ensure!(
+        planes == PLANES || planes == BASE_PLANES,
+        "入力平面数 {planes} には対応していません ({PLANES} か {BASE_PLANES})"
+    );
+    Ok(planes)
+}
+
+/// boards の特徴を、1 局面 feature_len (入力平面数 × CELLS) ずつ並べる。
+fn encode_all(boards: &[Board], feature_len: usize) -> Vec<u8> {
+    let mut features = vec![0; boards.len() * feature_len];
+    for (board, out) in boards.iter().zip(features.chunks_exact_mut(feature_len)) {
         encode(board, out);
     }
     features
 }
 
+/// encode_all と同じだが、VCF を読む特徴は局面ごとに別のスレッドで作る。探索スレッドが 1 つだけのとき
+/// (人との対局) は、特徴を作る時間が推論の時間に近くなるため。探索スレッドが多いとき (自己対局) は使わない。
+fn encode_all_parallel(boards: &[Board], feature_len: usize) -> Vec<u8> {
+    if feature_len < PLANES * CELLS || boards.len() < 2 {
+        return encode_all(boards, feature_len);
+    }
+    let mut features = vec![0; boards.len() * feature_len];
+    thread::scope(|s| {
+        for (board, out) in boards.iter().zip(features.chunks_exact_mut(feature_len)) {
+            s.spawn(move || encode(board, out));
+        }
+    });
+    features
+}
+
 impl Evaluator for OnnxModel {
     fn evaluate(&mut self, boards: &[Board]) -> Vec<Evaluation> {
-        self.run(&encode_all(boards)).expect("推論に失敗しました")
+        self.run(&encode_all_parallel(boards, self.feature_len())).expect("推論に失敗しました")
     }
 }
 
@@ -232,10 +269,14 @@ pub struct InferenceServer {
     tx: Option<Sender<Request>>,
     handles: Vec<JoinHandle<anyhow::Result<()>>>,
     evaluated: Arc<AtomicU64>,
+    /// 1 局面分の特徴の長さ (全てのモデルで同じ)
+    feature_len: usize,
 }
 
 impl InferenceServer {
     pub fn start(models: Vec<OnnxModel>, max_batch: usize) -> Self {
+        let feature_len = models.first().expect("モデルがない").feature_len();
+        assert!(models.iter().all(|m| m.feature_len() == feature_len), "入力の形が違うモデルが混ざっている");
         let (tx, rx) = mpsc::channel();
         let rx = Arc::new(Mutex::new(rx));
         let evaluated = Arc::new(AtomicU64::new(0));
@@ -247,7 +288,7 @@ impl InferenceServer {
                 thread::spawn(move || serve(model, &rx, max_batch, &evaluated))
             })
             .collect();
-        Self { tx: Some(tx), handles, evaluated }
+        Self { tx: Some(tx), handles, evaluated, feature_len }
     }
 
     /// これまでに推論した局面数
@@ -265,7 +306,7 @@ impl InferenceServer {
     }
 
     pub fn evaluator(&self) -> RemoteEvaluator {
-        RemoteEvaluator { tx: self.tx.clone().expect("停止済み") }
+        RemoteEvaluator { tx: self.tx.clone().expect("停止済み"), feature_len: self.feature_len }
     }
 
     /// 全ての RemoteEvaluator が破棄された後に呼ぶ。推論スレッドのエラーを返す。
@@ -284,7 +325,8 @@ fn serve(
     max_batch: usize,
     evaluated: &AtomicU64,
 ) -> anyhow::Result<()> {
-    let positions = |reqs: &[Request]| reqs.iter().map(|r| r.features.len() / FEATURE_LEN).sum::<usize>();
+    let feature_len = model.feature_len();
+    let positions = |reqs: &[Request]| reqs.iter().map(|r| r.features.len() / feature_len).sum::<usize>();
     let mut carry: Option<Request> = None;
     loop {
         // 受信側をロックしている間に 1 バッチ分集め、推論はロックを外してから行う
@@ -319,7 +361,7 @@ fn serve(
         };
         evaluated.fetch_add(evals.len() as u64, Ordering::Relaxed);
         for req in requests {
-            let n = req.features.len() / FEATURE_LEN;
+            let n = req.features.len() / feature_len;
             // 要求元が既に終了していても問題ない
             let _ = req.reply.send(evals.by_ref().take(n).collect());
         }
@@ -329,12 +371,15 @@ fn serve(
 /// InferenceServer に評価を依頼する Evaluator。探索スレッドごとに 1 つ持つ。
 pub struct RemoteEvaluator {
     tx: Sender<Request>,
+    /// 特徴は探索スレッドで作る (VCF を読むので推論スレッドでまとめて作ると遅い)
+    feature_len: usize,
 }
 
 impl Evaluator for RemoteEvaluator {
     fn evaluate(&mut self, boards: &[Board]) -> Vec<Evaluation> {
         let (reply, rx) = mpsc::channel();
-        self.tx.send(Request { features: encode_all(boards), reply }).expect("推論スレッドが停止しています");
+        let features = encode_all(boards, self.feature_len);
+        self.tx.send(Request { features, reply }).expect("推論スレッドが停止しています");
         rx.recv().expect("推論スレッドが停止しています")
     }
 }

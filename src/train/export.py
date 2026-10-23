@@ -1,6 +1,6 @@
 """学習済みネットワークを Rust (ort) 用の ONNX に書き出す。
 
-入力 "input" [batch, IN_CHANNELS, 15, 15] float32
+入力 "input" [batch, 入力平面数 (network.IN_CHANNELS), 15, 15] float32
 出力 "policy" [batch, 225] (ロジット), "value" [batch] (tanh)
 fp16 で書き出しても入出力は float32 のまま (内部の計算だけ float16)。
 """
@@ -13,7 +13,7 @@ import torch
 
 from torch import nn
 
-from network import BOARD_SIZE, IN_CHANNELS, PolicyValueNet
+from network import BOARD_SIZE, PolicyValueNet
 
 
 class HalfPrecision(nn.Module):
@@ -31,9 +31,10 @@ class HalfPrecision(nn.Module):
 def export_onnx(model: PolicyValueNet, path: Path, fp16: bool = False) -> None:
     """推論モードのコピーを書き出す。書き込み途中のファイルを Rust が読まないよう最後に置き換える。"""
     model = copy.deepcopy(model).cpu().float().eval()
+    in_channels = model.stem[0].in_channels
     if fp16:
         model = HalfPrecision(model).eval()
-    dummy = torch.zeros(2, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+    dummy = torch.zeros(2, in_channels, BOARD_SIZE, BOARD_SIZE)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp.onnx")
     torch.onnx.export(

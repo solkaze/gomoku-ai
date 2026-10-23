@@ -14,10 +14,10 @@ import torch
 from config import DEFAULT_CONFIG, Config, ModelConfig, Paths, load_config
 from distill import lr_at_step
 from export import export_onnx
-from network import BOARD_SIZE, CELLS, IN_CHANNELS, PolicyValueNet, loss_fn
+from network import BASE_IN_CHANNELS, BOARD_SIZE, CELLS, IN_CHANNELS, PolicyValueNet, loss_fn
 from pipeline import ensure_best
 from replay import ReplayBuffer, augment, transform
-from trainer import adopt, init, load, lr_at, make_optimizer, model_path, new_positions, prune, save
+from trainer import adopt, init, load, lr_at, make_optimizer, model_path, new_positions, prune, save, widen_input
 
 
 def fake_data(n: int, seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -51,7 +51,8 @@ def test_augment_moves_policy_with_stones() -> None:
 def test_training_reduces_loss() -> None:
     torch.manual_seed(0)
     model = PolicyValueNet(channels=16, blocks=2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    # 1e-2 では初期値によって発散することがある
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     states, policy, value = (torch.from_numpy(a) for a in fake_data(32))
     states = states.float()
 
@@ -214,6 +215,47 @@ def test_adopt_backs_up_and_continues_iteration(tmp_path: Path) -> None:
     # 既にある自己対局データは学習済み扱い
     assert new_positions(config.paths.selfplay_dir, adopted.trained_until)[0] == 0
     assert (config.paths.model_dir / "iter_0008.onnx").exists()
+
+
+def test_old_checkpoint_is_widened_without_changing_outputs(tmp_path: Path) -> None:
+    """VCF の平面を加える前のチェックポイントは、入力を広げても同じ出力を返し、続きから学習できる。"""
+    config = small_config(tmp_path)
+    torch.manual_seed(0)
+    old = PolicyValueNet(channels=8, blocks=1, in_channels=BASE_IN_CHANNELS).eval()
+    optimizer = make_optimizer(old, config)
+    old(torch.zeros(1, BASE_IN_CHANNELS, BOARD_SIZE, BOARD_SIZE))[1].sum().backward()
+    optimizer.step()
+    config.paths.checkpoint_dir.mkdir(parents=True)
+    torch.save(
+        {
+            "iteration": 5,
+            "step": 40,
+            "trained_until": 0.0,
+            # 古いチェックポイントには in_channels がない
+            "model_config": {"channels": 8, "blocks": 1},
+            "model": old.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        },
+        config.paths.checkpoint_dir / "latest.pt",
+    )
+    state = load(config, torch.device("cpu"))
+    assert (state.iteration, state.step) == (5, 40)
+    assert state.model.stem[0].in_channels == IN_CHANNELS
+
+    x = torch.rand(4, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+    state.model.eval()
+    with torch.no_grad():
+        for new_out, old_out in zip(state.model(x), old(x[:, :BASE_IN_CHANNELS]), strict=True):
+            assert torch.allclose(new_out, old_out, atol=1e-6)
+    # 広げた optimizer で学習でき、保存すると新しい平面数で残る
+    state.model.train()
+    state.model(x)[1].sum().backward()
+    state.optimizer.step()
+    save(config, state)
+    data = torch.load(config.paths.checkpoint_dir / "latest.pt", weights_only=True)
+    assert data["in_channels"] == IN_CHANNELS
+    widen_input(data)  # 既に広げたものは変えない
+    assert data["model"]["stem.0.weight"].shape[1] == IN_CHANNELS
 
 
 def fake_evaluate(tmp_path: Path, score: float) -> Path:

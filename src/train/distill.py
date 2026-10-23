@@ -20,7 +20,14 @@ from config import Config, ModelConfig
 from export import export_onnx
 from network import PolicyValueNet, loss_fn
 from replay import ReplayBuffer, newest_files
-from trainer import LATEST_CHECKPOINT, has_checkpoint, make_optimizer, model_channels
+from trainer import (
+    LATEST_CHECKPOINT,
+    has_checkpoint,
+    make_optimizer,
+    model_channels,
+    model_from_checkpoint,
+    model_in_channels,
+)
 
 VALIDATION_EVERY = 50
 # 学習率: warmup ステップで lr まで上げ、そこから cosine で lr * MIN_LR_RATIO まで下げる
@@ -69,9 +76,7 @@ def current_model(config: Config, device: torch.device) -> PolicyValueNet | None
     if not has_checkpoint(config):
         return None
     data = torch.load(config.paths.checkpoint_dir / LATEST_CHECKPOINT, map_location=device, weights_only=True)
-    model = PolicyValueNet.from_config(ModelConfig(**data["model_config"])).to(device)
-    model.load_state_dict(data["model"])
-    return model
+    return model_from_checkpoint(data, device)
 
 
 def distill(config: Config, args: DistillArgs) -> None:
@@ -131,6 +136,7 @@ def distill(config: Config, args: DistillArgs) -> None:
     torch.save(
         {
             "model_config": {"channels": model_channels(model), "blocks": len(model.trunk)},
+            "in_channels": model_in_channels(model),
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
         },

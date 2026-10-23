@@ -5,6 +5,9 @@
     1: 相手の石
     2: 手番が黒なら全て 1
     3: 黒の禁じ手の点
+    4: 手番側の VCF の攻め手 (VCF がなければ全て 0)
+    5: 相手の VCF の攻め手 (手番側が一手休んだとして読んだもの)
+4・5 を加える前のモデルは 0〜3 だけを入力にする (BASE_IN_CHANNELS)。
 出力は方策ロジット [B, 225] と、手番側から見た価値 [B] (tanh, -1〜1)。
 """
 
@@ -16,7 +19,9 @@ from config import ModelConfig
 
 BOARD_SIZE = 15
 CELLS = BOARD_SIZE * BOARD_SIZE
-IN_CHANNELS = 4
+IN_CHANNELS = 6
+# VCF の平面を加える前のモデルの入力平面数
+BASE_IN_CHANNELS = 4
 
 
 class ResBlock(nn.Module):
@@ -34,10 +39,10 @@ class ResBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    def __init__(self, channels: int, blocks: int) -> None:
+    def __init__(self, channels: int, blocks: int, in_channels: int = IN_CHANNELS) -> None:
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(IN_CHANNELS, channels, 3, padding=1, bias=False),
+            nn.Conv2d(in_channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(),
         )
