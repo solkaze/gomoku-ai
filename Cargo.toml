@@ -4,11 +4,41 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ndarray = "0.17.2"
-ort = "2.0.0-rc.13"
-tch = "0.26.0"
+# onnxruntime 本体は venv の onnxruntime-gpu (公式ビルド、RTX 50 系の sm_120 対応) を実行時に読み込む
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "cuda", "api-27"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+rand = "0.9"
+rand_distr = "0.5"
+crossterm = "0.28"
+libc = "0.2"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+
+[lib]
+name = "gomoku_engine"
+path = "src/engine/lib.rs"
 
 [[bin]]
 name = "gomoku"
 path = "src/run/main.rs"
 
+[[bin]]
+name = "selfplay"
+path = "src/selfplay/main.rs"
+
+[[bin]]
+name = "evaluate"
+path = "src/evaluate/main.rs"
+
+[[bin]]
+name = "web"
+path = "src/web/main.rs"
+
+[[bin]]
+name = "vct_scan"
+path = "src/vct_scan/main.rs"

@@ -1,0 +1,273 @@
+"""チェックポイントの保存・読み込みと 1 イテレーション分の学習。"""
+
+import math
+import os
+import re
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from config import Config, ModelConfig
+from export import export_onnx
+from network import BASE_IN_CHANNELS, IN_CHANNELS, PolicyValueNet, loss_fn
+from replay import ReplayBuffer
+
+LATEST_CHECKPOINT = "latest.pt"
+# 入力の畳み込みの重み (入力平面数を広げるときに使う)
+STEM_WEIGHT = "stem.0.weight"
+LATEST_MODEL = "latest.onnx"
+ITER_PATTERN = re.compile(r"iter_(\d+)")
+
+
+@dataclass
+class TrainState:
+    model: PolicyValueNet
+    optimizer: torch.optim.Optimizer
+    iteration: int
+    # これまでの累計学習ステップ数 (学習率スケジュールに使う)
+    step: int
+    # 学習に使った自己対局ファイルのうち最も新しい更新時刻。これより新しいファイルが「新しいデータ」
+    trained_until: float
+
+
+def iter_name(iteration: int) -> str:
+    return f"iter_{iteration:04d}"
+
+
+def model_path(config: Config, iteration: int) -> Path:
+    return config.paths.model_dir / f"{iter_name(iteration)}.onnx"
+
+
+def lr_at(schedule: list[tuple[int, float]], step: int) -> float:
+    lr = schedule[0][1]
+    for start, value in schedule:
+        if step >= start:
+            lr = value
+    return lr
+
+
+def make_optimizer(model: PolicyValueNet, config: Config) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(
+        model.parameters(), lr=lr_at(config.train.lr_schedule, 0), weight_decay=config.train.weight_decay
+    )
+
+
+def replace_file(src: Path, dst: Path) -> None:
+    """dst を読んでいるプロセスが途中の内容を見ないよう、コピーしてから置き換える。"""
+    tmp = dst.with_name(dst.name + ".tmp")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
+def model_channels(model: PolicyValueNet) -> int:
+    return model.stem[0].out_channels
+
+
+def model_in_channels(model: PolicyValueNet) -> int:
+    return model.stem[0].in_channels
+
+
+def widen_input(data: dict) -> None:
+    """VCF の平面を加える前 (入力 BASE_IN_CHANNELS 平面) のチェックポイント data を IN_CHANNELS 平面に広げる。
+    増えた入力の重みは 0 にするので、広げた直後の出力は元のモデルと変わらない。optimizer の状態も同じ形に広げる。"""
+    in_channels = data.get("in_channels", BASE_IN_CHANNELS)
+    if in_channels == IN_CHANNELS:
+        return
+    old = data["model"][STEM_WEIGHT]
+
+    def pad(t: torch.Tensor) -> torch.Tensor:
+        return torch.cat([t, t.new_zeros(t.shape[0], IN_CHANNELS - t.shape[1], *t.shape[2:])], dim=1)
+
+    data["model"][STEM_WEIGHT] = pad(old)
+    # 入力の畳み込みの Adam の moment は、重みと同じ形をしている (この形の引数はほかにない)
+    for param_state in data.get("optimizer", {}).get("state", {}).values():
+        for key, value in param_state.items():
+            if isinstance(value, torch.Tensor) and value.shape == old.shape:
+                param_state[key] = pad(value)
+    data["in_channels"] = IN_CHANNELS
+    print(f"入力平面を {in_channels} から {IN_CHANNELS} に増やしました (増えた入力の重みは 0 から学習します)")
+
+
+def model_from_checkpoint(data: dict, device: torch.device) -> PolicyValueNet:
+    """チェックポイントのモデルを、構造をチェックポイントに合わせて作る。入力平面が少ない古いものは広げる。"""
+    widen_input(data)
+    model = PolicyValueNet.from_config(ModelConfig(**data["model_config"])).to(device)
+    model.load_state_dict(data["model"])
+    return model
+
+
+def export_latest(config: Config, model: PolicyValueNet, iteration: int) -> Path:
+    onnx = model_path(config, iteration)
+    export_onnx(model, onnx, fp16=config.train.export_fp16)
+    replace_file(onnx, config.paths.model_dir / LATEST_MODEL)
+    return onnx
+
+
+def save(config: Config, state: TrainState) -> None:
+    ckpt_dir = config.paths.checkpoint_dir
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = ckpt_dir / f"{iter_name(state.iteration)}.pt"
+    tmp = ckpt.with_name(ckpt.name + ".tmp")
+    torch.save(
+        {
+            "iteration": state.iteration,
+            "step": state.step,
+            "trained_until": state.trained_until,
+            "model_config": {"channels": model_channels(state.model), "blocks": len(state.model.trunk)},
+            "in_channels": model_in_channels(state.model),
+            "model": state.model.state_dict(),
+            "optimizer": state.optimizer.state_dict(),
+        },
+        tmp,
+    )
+    os.replace(tmp, ckpt)
+    replace_file(ckpt, ckpt_dir / LATEST_CHECKPOINT)
+    onnx = export_latest(config, state.model, state.iteration)
+    prune(config, state.iteration)
+    print(f"保存しました: {ckpt} / {onnx}")
+
+
+def has_checkpoint(config: Config) -> bool:
+    return (config.paths.checkpoint_dir / LATEST_CHECKPOINT).exists()
+
+
+def load(config: Config, device: torch.device) -> TrainState:
+    path = config.paths.checkpoint_dir / LATEST_CHECKPOINT
+    if not path.exists():
+        sys.exit(f"チェックポイントがありません: {path}\n先に `init` を実行してください。")
+    data = torch.load(path, map_location=device, weights_only=True)
+    # 構造はチェックポイントに合わせる (設定ファイルを後から変えても読めるように)
+    model_config = ModelConfig(**data["model_config"])
+    if model_config != config.model:
+        print(f"注意: 設定 {config.model} ではなくチェックポイントの {model_config} を使います")
+    model = model_from_checkpoint(data, device)
+    optimizer = make_optimizer(model, config)
+    optimizer.load_state_dict(data["optimizer"])
+    return TrainState(
+        model=model,
+        optimizer=optimizer,
+        iteration=data["iteration"],
+        step=data.get("step", 0),
+        trained_until=data.get("trained_until", 0.0),
+    )
+
+
+def current_iteration(config: Config) -> int:
+    data = torch.load(config.paths.checkpoint_dir / LATEST_CHECKPOINT, map_location="cpu", weights_only=True)
+    return data["iteration"]
+
+
+def init(config: Config) -> None:
+    model = PolicyValueNet.from_config(config.model)
+    save(config, TrainState(model, make_optimizer(model, config), iteration=0, step=0, trained_until=0.0))
+
+
+def adopt(config: Config, path: Path) -> int:
+    """別に学習したチェックポイント (distill の出力など) を学習ループの最新モデルにする。
+    今の最新チェックポイントは backup_iter_XXXX.pt として残す。新しいイテレーション番号を返す。
+
+    学習率スケジュールの累計ステップ数は 0 から数え直し、今ある自己対局データは学習済みとして扱う。"""
+    data = torch.load(path, map_location="cpu", weights_only=True)
+    model = model_from_checkpoint(data, torch.device("cpu"))
+    optimizer = make_optimizer(model, config)
+    optimizer.load_state_dict(data["optimizer"])
+
+    iteration = 0
+    if has_checkpoint(config):
+        iteration = current_iteration(config)
+        backup = config.paths.checkpoint_dir / f"backup_{iter_name(iteration)}.pt"
+        replace_file(config.paths.checkpoint_dir / LATEST_CHECKPOINT, backup)
+        print(f"今のチェックポイントを残しました: {backup}")
+    files = list(config.paths.selfplay_dir.glob("*.npz"))
+    trained_until = max((p.stat().st_mtime for p in files), default=0.0)
+    save(config, TrainState(model, optimizer, iteration + 1, step=0, trained_until=trained_until))
+    return iteration + 1
+
+
+def new_positions(selfplay_dir: Path, since: float) -> tuple[int, float]:
+    """更新時刻が since より新しい自己対局ファイルの局面数と、その中で最も新しい更新時刻。"""
+    count, newest = 0, since
+    for path in selfplay_dir.glob("*.npz"):
+        mtime = path.stat().st_mtime
+        if mtime > since:
+            with np.load(path) as data:
+                count += len(data["value"])
+            newest = max(newest, mtime)
+    return count, newest
+
+
+def train_iteration(config: Config) -> int | None:
+    """新しい自己対局データの量に応じて学習し、新しいイテレーション番号を返す。学習しなかったら None。"""
+    tc = config.train
+    device = torch.device(tc.device)
+    state = load(config, device)
+    fresh, newest = new_positions(config.paths.selfplay_dir, state.trained_until)
+    if fresh == 0:
+        print("新しい自己対局データがないので学習しません")
+        return None
+    buffer = ReplayBuffer.load(config.paths.selfplay_dir, tc.replay_window, device)
+    if len(buffer) < tc.min_replay:
+        print(f"リプレイバッファが {len(buffer)} / {tc.min_replay} 局面なので、まだ学習しません")
+        return None
+
+    steps = math.ceil(fresh * tc.samples_per_position / tc.batch_size)
+    iteration = state.iteration + 1
+    print(f"iteration {iteration}: 新しい局面 {fresh} / バッファ {len(buffer)} 局面で {steps} ステップ学習します")
+
+    writer = SummaryWriter(config.paths.log_dir)
+    use_amp = tc.amp and device.type == "cuda"
+    model, optimizer = state.model, state.optimizer
+    model.train()
+    for i in tqdm(range(steps), desc=f"iter {iteration}", mininterval=5):
+        lr = lr_at(tc.lr_schedule, state.step)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        states, target_policy, target_value = buffer.sample(tc.batch_size)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
+            policy_logits, value = model(states)
+        loss, policy_loss, value_loss = loss_fn(
+            policy_logits, value, target_policy, target_value, tc.value_loss_weight
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        state.step += 1
+
+        if i % 50 == 0 or i == steps - 1:
+            writer.add_scalar("loss/total", loss.item(), state.step)
+            writer.add_scalar("loss/policy", policy_loss.item(), state.step)
+            writer.add_scalar("loss/value", value_loss.item(), state.step)
+            writer.add_scalar("train/lr", lr, state.step)
+    writer.add_scalar("train/iteration", iteration, state.step)
+    writer.add_scalar("train/replay_size", len(buffer), state.step)
+    writer.close()
+    print(f"最終損失: policy {policy_loss.item():.4f} / value {value_loss.item():.4f} (lr {lr:g})")
+
+    state.iteration = iteration
+    state.trained_until = newest
+    save(config, state)
+    del buffer
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return iteration
+
+
+def prune(config: Config, latest: int) -> None:
+    """直近 keep_last 個と keep_every ごと以外の古いファイルを消す。
+    自己対局に使う最強モデルと強さの基準モデルは別名のコピーなので、ここでは消えない。"""
+    lc = config.loop
+
+    def keep(i: int) -> bool:
+        return i > latest - lc.keep_last or i % lc.keep_every == 0
+
+    for directory, suffix in ((config.paths.checkpoint_dir, ".pt"), (config.paths.model_dir, ".onnx")):
+        for path in directory.glob(f"iter_*{suffix}"):
+            match = ITER_PATTERN.fullmatch(path.name.removesuffix(suffix))
+            if match and not keep(int(match.group(1))):
+                path.unlink()

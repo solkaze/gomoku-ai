@@ -1,0 +1,385 @@
+//! ONNX モデル (src/train/export.py が書き出したもの) の推論。
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use anyhow::Context;
+use ort::AsPointer;
+use ort::environment::Environment;
+use ort::ep;
+use ort::session::Session;
+use ort::value::Tensor;
+
+use crate::board::{Board, CELLS, SIZE};
+use crate::config::{Device, InferenceConfig};
+use crate::features::{BASE_PLANES, PLANES, encode};
+use crate::mcts::{Evaluation, Evaluator};
+
+/// CUDA 実行プロバイダが使うライブラリ。依存される側から順に読み込む。
+const CUDA_DYLIBS: &[&str] = &[
+    "libcudart.so.13",
+    "libcublasLt.so.13",
+    "libcublas.so.13",
+    "libnvrtc.so.13",
+    "libcurand.so.10",
+    "libcufft.so.12",
+    "libcudnn.so.9",
+    "libcudnn_graph.so.9",
+    "libcudnn_ops.so.9",
+    "libcudnn_heuristic.so.9",
+    "libcudnn_adv.so.9",
+    "libcudnn_cnn.so.9",
+    "libcudnn_engines_precompiled.so.9",
+    "libcudnn_engines_runtime_compiled.so.9",
+];
+
+/// 起動時の読み込みの段階 (進捗表示用)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadStage {
+    CudaLibs,
+    Runtime,
+    Session,
+    Warmup,
+}
+
+impl LoadStage {
+    /// device で推論するときに通る段階を、通る順に返す。
+    pub fn stages(device: Device) -> &'static [LoadStage] {
+        const ALL: [LoadStage; 4] = [LoadStage::CudaLibs, LoadStage::Runtime, LoadStage::Session, LoadStage::Warmup];
+        match device {
+            Device::Cuda => &ALL,
+            Device::Cpu => &ALL[1..],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LoadStage::CudaLibs => "CUDA / cuDNN ライブラリの読み込み",
+            LoadStage::Runtime => "ONNX Runtime の読み込み",
+            LoadStage::Session => "モデルの読み込み",
+            LoadStage::Warmup => "試し推論",
+        }
+    }
+}
+
+/// onnxruntime を読み込み、CUDA を使う場合はその依存ライブラリも先に読み込む。
+/// 推論 (OnnxModel::load) の前に 1 度呼ぶ。2 回目以降は何もしない。
+pub fn init_runtime(config: &InferenceConfig) -> anyhow::Result<()> {
+    init_runtime_with(config, &mut |_| {})
+}
+
+/// init_runtime と同じだが、各段階に入るたびに on_stage を呼ぶ。
+pub fn init_runtime_with(config: &InferenceConfig, on_stage: &mut dyn FnMut(LoadStage)) -> anyhow::Result<()> {
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            if config.device == Device::Cuda {
+                on_stage(LoadStage::CudaLibs);
+                preload_cuda(&config.cuda_lib_dirs).map_err(|e| format!("{e:#}"))?;
+            }
+            on_stage(LoadStage::Runtime);
+            let lib = find_onnxruntime(&config.onnxruntime_dir).map_err(|e| format!("{e:#}"))?;
+            ort::init_from(&lib).map_err(|e| format!("{} を読み込めません: {e}", lib.display()))?.commit();
+            RUNTIME_LOADED.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
+/// onnxruntime を読み込んだか (読み込んでいなければ、終了時に解放するものもない)
+static RUNTIME_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// ONNX Runtime の環境 (OrtEnv) を今すぐ解放する。セッションが残っていて解放できなければ false。
+///
+/// OrtEnv は、ライブラリの静的オブジェクトが破棄される前に解放しなければならない。ort は終了時に自動で解放するが、
+/// その時点 (実行ファイルの .fini_array) では、後から dlopen した CUDA プロバイダの静的オブジェクトが既に
+/// 破棄されている (dlopen したライブラリのデストラクタは exit の早い段階で呼ばれる)。その状態で解放すると、
+/// プロバイダが解放済みのメモリの参照カウントを書き換え、ヒープが壊れる (終了時にまれに
+/// 「corrupted double-linked list」で異常終了する)。そこで、終了処理が始まる前に自分で解放する。
+fn release_environment() -> bool {
+    let Ok(env) = Environment::current() else { return false };
+    // ort 自身が持つ参照と、今取得した参照。それ以外があれば、まだセッションが生きている
+    if Arc::strong_count(&env) != 2 {
+        return false;
+    }
+    let ptr = env.ptr().cast_mut();
+    // 参照を 1 つ捨てずに残し、ort が終了時にもう一度解放しないようにする
+    std::mem::forget(env);
+    // SAFETY: ptr は ort が作った有効な OrtEnv で、これを使うセッションは残っていない。
+    // ort 側の解放は上で止めたので、二重に解放されることもない
+    unsafe { (ort::api().ReleaseEnv)(ptr) };
+    true
+}
+
+/// main の結果を表示してプロセスを終了する。推論に使ったモデル (セッション) を全て破棄してから呼ぶこと。
+pub fn exit(result: anyhow::Result<()>) -> ! {
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            1
+        }
+    };
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    if !RUNTIME_LOADED.load(Ordering::Relaxed) || release_environment() {
+        std::process::exit(code);
+    }
+    // エラーの途中などでセッションが残っていると、正しい順序で解放できない。
+    // そのまま終了処理に入るとヒープを壊しうるので、終了処理を飛ばして終わる
+    // SAFETY: _exit は何も後始末をせずにプロセスを終えるだけで、呼び出しに前提条件はない
+    unsafe { libc::_exit(code) }
+}
+
+/// dir の中の libonnxruntime.so.<バージョン> を探す。
+fn find_onnxruntime(dir: &Path) -> anyhow::Result<PathBuf> {
+    let entries = std::fs::read_dir(dir).with_context(|| format!("{} がありません (uv sync を実行してください)", dir.display()))?;
+    entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("libonnxruntime.so")))
+        .with_context(|| format!("{} に libonnxruntime.so がありません", dir.display()))
+}
+
+/// lib_dirs にある CUDA / cuDNN を先に読み込む (Python の venv 同梱のものを使うため)。
+/// 見つからないライブラリはシステムの検索パスに任せる。
+fn preload_cuda(lib_dirs: &[PathBuf]) -> anyhow::Result<()> {
+    for name in CUDA_DYLIBS {
+        if let Some(path) = lib_dirs.iter().map(|d| d.join(name)).find(|p| p.exists()) {
+            ort::util::preload_dylib(&path).with_context(|| format!("{} を読み込めません", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+const BATCH_ALIGN: usize = 32;
+
+pub struct OnnxModel {
+    session: Session,
+    /// モデルの入力平面数 (features::PLANES か、VCF の平面を加える前のモデルなら BASE_PLANES)
+    planes: usize,
+}
+
+impl OnnxModel {
+    pub fn load(path: &Path, device: Device) -> anyhow::Result<Self> {
+        Self::load_with(path, device, &mut |_| {})
+    }
+
+    /// load と同じだが、各段階に入るたびに on_stage を呼ぶ。
+    pub fn load_with(path: &Path, device: Device, on_stage: &mut dyn FnMut(LoadStage)) -> anyhow::Result<Self> {
+        on_stage(LoadStage::Session);
+        let mut builder = Session::builder()?;
+        if device == Device::Cuda {
+            builder = builder
+                .with_execution_providers([ep::CUDA::default().build().error_on_failure()])
+                .map_err(|e| anyhow::anyhow!("CUDA を有効にできません: {e}"))?;
+        }
+        let session = builder.commit_from_file(path).with_context(|| format!("{} を読み込めません", path.display()))?;
+        let planes = input_planes(&session).with_context(|| format!("{} の入力の形を読めません", path.display()))?;
+        let mut model = Self { session, planes };
+        on_stage(LoadStage::Warmup);
+        // GPU で実際に動くかは推論してみるまで分からない (例: GPU の世代向けのカーネルがない) ので、ここで一度試す
+        model.run(&vec![0; model.feature_len()]).with_context(|| {
+            format!(
+                "{device:?} での試し推論に失敗しました。onnxruntime の CUDA 版がこの GPU の世代 \
+                 (compute capability) に対応していない可能性があります"
+            )
+        })?;
+        Ok(model)
+    }
+
+    /// 1 局面分の特徴の長さ (入力平面数 × CELLS)。
+    pub fn feature_len(&self) -> usize {
+        self.planes * CELLS
+    }
+
+    /// features は n 局面分の特徴平面 (n * feature_len)。
+    pub fn run(&mut self, features: &[u8]) -> anyhow::Result<Vec<Evaluation>> {
+        let feature_len = self.feature_len();
+        let n = features.len() / feature_len;
+        // cuDNN は入力の形ごとに畳み込みアルゴリズムを探索し直すので、バッチを BATCH_ALIGN の倍数に揃えて形の種類を減らす
+        let padded = n.max(1).next_multiple_of(BATCH_ALIGN);
+        let mut input: Vec<f32> = features.iter().map(|&x| x as f32).collect();
+        input.resize(padded * feature_len, 0.0);
+        let input = Tensor::from_array(([padded, self.planes, SIZE, SIZE], input))?;
+        let outputs = self.session.run(ort::inputs!["input" => input])?;
+        let (_, policy) = outputs["policy"].try_extract_tensor::<f32>()?;
+        let (_, value) = outputs["value"].try_extract_tensor::<f32>()?;
+        Ok((0..n)
+            .map(|i| Evaluation { policy: policy[i * CELLS..(i + 1) * CELLS].to_vec(), value: value[i] })
+            .collect())
+    }
+}
+
+/// ONNX の入力 "input" [batch, planes, 15, 15] の planes。対応している平面数でなければエラー。
+fn input_planes(session: &Session) -> anyhow::Result<usize> {
+    let input = session.inputs().first().context("入力がありません")?;
+    let shape = input.dtype().tensor_shape().context("入力がテンソルではありません")?;
+    let planes = usize::try_from(*shape.get(1).context("入力の次元が足りません")?).unwrap_or(0);
+    anyhow::ensure!(
+        planes == PLANES || planes == BASE_PLANES,
+        "入力平面数 {planes} には対応していません ({PLANES} か {BASE_PLANES})"
+    );
+    Ok(planes)
+}
+
+/// boards の特徴を、1 局面 feature_len (入力平面数 × CELLS) ずつ並べる。
+fn encode_all(boards: &[Board], feature_len: usize) -> Vec<u8> {
+    let mut features = vec![0; boards.len() * feature_len];
+    for (board, out) in boards.iter().zip(features.chunks_exact_mut(feature_len)) {
+        encode(board, out);
+    }
+    features
+}
+
+/// encode_all と同じだが、VCF を読む特徴は局面ごとに別のスレッドで作る。探索スレッドが 1 つだけのとき
+/// (人との対局) は、特徴を作る時間が推論の時間に近くなるため。探索スレッドが多いとき (自己対局) は使わない。
+fn encode_all_parallel(boards: &[Board], feature_len: usize) -> Vec<u8> {
+    if feature_len < PLANES * CELLS || boards.len() < 2 {
+        return encode_all(boards, feature_len);
+    }
+    let mut features = vec![0; boards.len() * feature_len];
+    thread::scope(|s| {
+        for (board, out) in boards.iter().zip(features.chunks_exact_mut(feature_len)) {
+            s.spawn(move || encode(board, out));
+        }
+    });
+    features
+}
+
+impl Evaluator for OnnxModel {
+    fn evaluate(&mut self, boards: &[Board]) -> Vec<Evaluation> {
+        self.run(&encode_all_parallel(boards, self.feature_len())).expect("推論に失敗しました")
+    }
+}
+
+struct Request {
+    features: Vec<u8>,
+    reply: Sender<Vec<Evaluation>>,
+}
+
+/// 複数スレッドの探索から来る評価要求を 1 つのバッチにまとめて GPU で推論する。
+/// モデルを複数渡すと、あるバッチの推論中に次のバッチを集められる。
+pub struct InferenceServer {
+    tx: Option<Sender<Request>>,
+    handles: Vec<JoinHandle<anyhow::Result<()>>>,
+    evaluated: Arc<AtomicU64>,
+    /// 1 局面分の特徴の長さ (全てのモデルで同じ)
+    feature_len: usize,
+}
+
+impl InferenceServer {
+    pub fn start(models: Vec<OnnxModel>, max_batch: usize) -> Self {
+        let feature_len = models.first().expect("モデルがない").feature_len();
+        assert!(models.iter().all(|m| m.feature_len() == feature_len), "入力の形が違うモデルが混ざっている");
+        let (tx, rx) = mpsc::channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let evaluated = Arc::new(AtomicU64::new(0));
+        let handles = models
+            .into_iter()
+            .map(|model| {
+                let rx = Arc::clone(&rx);
+                let evaluated = Arc::clone(&evaluated);
+                thread::spawn(move || serve(model, &rx, max_batch, &evaluated))
+            })
+            .collect();
+        Self { tx: Some(tx), handles, evaluated, feature_len }
+    }
+
+    /// これまでに推論した局面数
+    pub fn evaluated(&self) -> u64 {
+        self.evaluated.load(Ordering::Relaxed)
+    }
+
+    /// 設定に従ってモデルを inference.threads 個読み込んで起動する。
+    pub fn load(path: &Path, config: &InferenceConfig) -> anyhow::Result<Self> {
+        init_runtime(config)?;
+        let models = (0..config.threads)
+            .map(|_| OnnxModel::load(path, config.device))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self::start(models, config.max_batch))
+    }
+
+    pub fn evaluator(&self) -> RemoteEvaluator {
+        RemoteEvaluator { tx: self.tx.clone().expect("停止済み"), feature_len: self.feature_len }
+    }
+
+    /// 全ての RemoteEvaluator が破棄された後に呼ぶ。推論スレッドのエラーを返す。
+    pub fn shutdown(mut self) -> anyhow::Result<()> {
+        self.tx.take();
+        for handle in self.handles.drain(..) {
+            handle.join().expect("推論スレッドがパニックしました")?;
+        }
+        Ok(())
+    }
+}
+
+fn serve(
+    mut model: OnnxModel,
+    rx: &Mutex<Receiver<Request>>,
+    max_batch: usize,
+    evaluated: &AtomicU64,
+) -> anyhow::Result<()> {
+    let feature_len = model.feature_len();
+    let positions = |reqs: &[Request]| reqs.iter().map(|r| r.features.len() / feature_len).sum::<usize>();
+    let mut carry: Option<Request> = None;
+    loop {
+        // 受信側をロックしている間に 1 バッチ分集め、推論はロックを外してから行う
+        let mut requests: Vec<Request> = carry.take().into_iter().collect();
+        {
+            let rx = rx.lock().expect("推論スレッドがパニックしました");
+            if requests.is_empty() {
+                let Ok(first) = rx.recv() else { return Ok(()) };
+                requests.push(first);
+            }
+            // 他の探索スレッドの要求が揃うのを少しだけ待ってからまとめて推論する
+            while positions(&requests) < max_batch {
+                match rx.recv_timeout(Duration::from_micros(200)) {
+                    // max_batch を超える要求は次のバッチに回す
+                    Ok(req) if positions(&requests) + positions(std::slice::from_ref(&req)) > max_batch => {
+                        carry = Some(req);
+                        break;
+                    }
+                    Ok(req) => requests.push(req),
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }
+        let features: Vec<u8> = requests.iter().flat_map(|r| r.features.iter().copied()).collect();
+        let mut evals = match model.run(&features) {
+            Ok(evals) => evals.into_iter(),
+            Err(e) => {
+                // 各探索スレッドが待ったまま巻き添えでパニックしないよう、原因を出してプロセスごと終了する
+                eprintln!("推論に失敗しました: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        evaluated.fetch_add(evals.len() as u64, Ordering::Relaxed);
+        for req in requests {
+            let n = req.features.len() / feature_len;
+            // 要求元が既に終了していても問題ない
+            let _ = req.reply.send(evals.by_ref().take(n).collect());
+        }
+    }
+}
+
+/// InferenceServer に評価を依頼する Evaluator。探索スレッドごとに 1 つ持つ。
+pub struct RemoteEvaluator {
+    tx: Sender<Request>,
+    /// 特徴は探索スレッドで作る (VCF を読むので推論スレッドでまとめて作ると遅い)
+    feature_len: usize,
+}
+
+impl Evaluator for RemoteEvaluator {
+    fn evaluate(&mut self, boards: &[Board]) -> Vec<Evaluation> {
+        let (reply, rx) = mpsc::channel();
+        let features = encode_all(boards, self.feature_len);
+        self.tx.send(Request { features, reply }).expect("推論スレッドが停止しています");
+        rx.recv().expect("推論スレッドが停止しています")
+    }
+}

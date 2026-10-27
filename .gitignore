@@ -13,3 +13,9 @@ wheels/
 # Added by cargo
 
 /target
+
+# 学習の成果物 (自己対局データ・チェックポイント・モデル・ログ)
+/runs
+
+# サーバーごとの compose 設定 (UID/GID)
+.env

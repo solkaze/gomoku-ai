@@ -1,0 +1,192 @@
+//! 自己対局 1 局分の生成。
+
+use rand::Rng;
+
+use crate::board::{Board, CELLS, CENTER, GameResult, SIZE, Stone};
+use crate::features::{FEATURE_LEN, encode};
+use crate::mcts::{Evaluator, Mcts};
+
+/// 学習データ 1 局面分。
+pub struct Sample {
+    pub features: Vec<u8>,
+    pub policy: Vec<f32>,
+    /// 手番側から見た最終結果
+    pub value: f32,
+}
+
+pub struct Game {
+    pub samples: Vec<Sample>,
+    pub result: GameResult,
+    pub moves: usize,
+}
+
+/// 開局のランダムな着手は、既にある石からこの距離 (チェビシェフ距離) 以内に打つ。
+const OPENING_REACH: usize = 2;
+
+/// 開局をランダムにした局面を作る。黒の初手 (天元) のあとに 0〜max_moves 手 (局ごとに一様に選ぶ) を
+/// ランダムに打つ。0 手のときは通常の初期局面を返すので、普通の開局も一定の割合で残る。
+/// 黒の禁じ手は打たず、決着のついた局面は返さない。
+pub fn random_opening<R: Rng>(max_moves: usize, rng: &mut R) -> Board {
+    loop {
+        let moves = rng.random_range(0..=max_moves);
+        let mut board = Board::new();
+        if moves == 0 {
+            return board;
+        }
+        board.play(CENTER).expect("天元は初手として合法");
+        for _ in 0..moves {
+            let candidates = opening_candidates(&board);
+            if candidates.is_empty() {
+                break;
+            }
+            board.play(candidates[rng.random_range(0..candidates.len())]).expect("候補は合法手");
+            if board.result() != GameResult::Ongoing {
+                break;
+            }
+        }
+        // ランダムな手で五ができてしまったら作り直す
+        if board.result() == GameResult::Ongoing {
+            return board;
+        }
+    }
+}
+
+/// 互角の開局の選び方。黒の先手が強く、ランダムな開局でも大半が黒勝ちになって勝敗から学べることが少ないので、
+/// 開局の局面を短い探索で評価し、手番側から見た価値の絶対値が max_value 以下のものだけを使う。
+/// 互角の開局には通常の開局 (天元と白の 2 手目だけ) がまず入らないので、games の割合の局だけに使い、
+/// 残りの局は random_opening をそのまま使う。
+#[derive(Clone, Copy, Debug)]
+pub struct OpeningBalance {
+    /// 受け入れる価値の絶対値の上限。1.0 以上で無効
+    pub max_value: f32,
+    /// 評価に使う探索回数 (ノイズなし)
+    pub simulations: u32,
+    /// 互角の開局を使う局の割合
+    pub games: f64,
+}
+
+impl OpeningBalance {
+    pub const OFF: Self = Self { max_value: 1.0, simulations: 0, games: 0.0 };
+}
+
+/// 互角の開局が見つからないときに諦めるまでの試行回数。諦めたら試した中で最も互角に近いものを使う。
+const BALANCE_TRIES: usize = 100;
+
+/// balance.games の確率で random_opening の局面のうち balance の条件を満たすものを、それ以外は random_opening を返す。
+pub fn balanced_opening<E: Evaluator, R: Rng>(
+    max_moves: usize,
+    balance: OpeningBalance,
+    mcts: &mut Mcts,
+    evaluator: &mut E,
+    rng: &mut R,
+) -> Board {
+    if balance.max_value >= 1.0 || !rng.random_bool(balance.games.clamp(0.0, 1.0)) {
+        return random_opening(max_moves, rng);
+    }
+    let mut closest: Option<(f32, Board)> = None;
+    for _ in 0..BALANCE_TRIES {
+        let board = random_opening(max_moves, rng);
+        let value = mcts.search_with(&board, evaluator, rng, balance.simulations, false).value.abs();
+        if value <= balance.max_value {
+            return board;
+        }
+        if closest.as_ref().is_none_or(|&(v, _)| value < v) {
+            closest = Some((value, board));
+        }
+    }
+    closest.expect("BALANCE_TRIES は 1 以上").1
+}
+
+/// 石の近くの空点。黒番では禁じ手を除く。
+fn opening_candidates(board: &Board) -> Vec<usize> {
+    let stones: Vec<(usize, usize)> =
+        (0..CELLS).filter(|&p| board.get(p).is_some()).map(|p| (p / SIZE, p % SIZE)).collect();
+    let near = |p: usize| {
+        let (row, col) = (p / SIZE, p % SIZE);
+        stones.iter().any(|&(r, c)| row.abs_diff(r) <= OPENING_REACH && col.abs_diff(c) <= OPENING_REACH)
+    };
+    let black = board.side_to_move() == Stone::Black;
+    (0..CELLS).filter(|&p| board.is_legal(p) && near(p) && !(black && board.is_forbidden(p))).collect()
+}
+
+/// playout cap randomization (KataGo): 各手を確率 full_prob で通常の探索 (mcts の設定どおり) にし、
+/// それ以外は fast_simulations 回・ノイズなしの速い探索で打つ。学習データにするのは通常の探索をした局面だけ。
+#[derive(Clone, Copy, Debug)]
+pub struct PlayoutCap {
+    pub full_prob: f64,
+    pub fast_simulations: u32,
+}
+
+impl PlayoutCap {
+    /// 全ての手を通常の探索で打つ (無効)。
+    pub const OFF: Self = Self { full_prob: 1.0, fast_simulations: 0 };
+}
+
+/// opening の局面から 1 局打つ。そこから temperature_moves 手は訪問回数に比例して手を選び、以降は最多訪問手を打つ。
+/// 学習データにするのは通常の探索をして打った局面だけで、opening までの手は含めない。
+pub fn play_game<E: Evaluator, R: Rng>(
+    mcts: &mut Mcts,
+    evaluator: &mut E,
+    opening: &Board,
+    temperature_moves: usize,
+    cap: PlayoutCap,
+    rng: &mut R,
+) -> Game {
+    let mut board = opening.clone();
+    let temperature_until = board.move_count() + temperature_moves;
+    let mut records: Vec<(Vec<u8>, Vec<f32>, Stone)> = Vec::new();
+    while board.result() == GameResult::Ongoing {
+        let full = cap.full_prob >= 1.0 || rng.random_bool(cap.full_prob.max(0.0));
+        let result = if full {
+            mcts.search(&board, evaluator, rng)
+        } else {
+            mcts.search_with(&board, evaluator, rng, cap.fast_simulations, false)
+        };
+        // 黒の初手は天元で固定なので学習しない
+        if full && board.move_count() > 0 {
+            let mut features = vec![0; FEATURE_LEN];
+            encode(&board, &mut features);
+            records.push((features, result.policy(), board.side_to_move()));
+        }
+        let temperature = if board.move_count() < temperature_until { 1.0 } else { 0.0 };
+        board.play(result.sample_move(temperature, rng)).expect("探索結果は合法手");
+    }
+
+    let outcome = board.result();
+    let samples = records
+        .into_iter()
+        .map(|(features, policy, side)| {
+            let value = match outcome {
+                GameResult::Win(winner) if winner == side => 1.0,
+                GameResult::Win(_) => -1.0,
+                _ => 0.0,
+            };
+            Sample { features, policy, value }
+        })
+        .collect();
+    Game { samples, result: outcome, moves: board.move_count() }
+}
+
+/// 別々の評価器 (モデル) 同士で opening の局面から 1 局打ち、結果を返す。強さの評価用。
+/// そこから temperature_moves 手は訪問回数に比例して手を選び、同じ棋譜ばかりにならないようにする。
+pub fn play_match<R: Rng>(
+    mcts: &mut Mcts,
+    black: &mut dyn Evaluator,
+    white: &mut dyn Evaluator,
+    opening: &Board,
+    temperature_moves: usize,
+    rng: &mut R,
+) -> GameResult {
+    let mut board = opening.clone();
+    let temperature_until = board.move_count() + temperature_moves;
+    while board.result() == GameResult::Ongoing {
+        let evaluator: &mut dyn Evaluator = match board.side_to_move() {
+            Stone::Black => &mut *black,
+            Stone::White => &mut *white,
+        };
+        let result = mcts.search(&board, evaluator, rng);
+        let temperature = if board.move_count() < temperature_until { 1.0 } else { 0.0 };
+        board.play(result.sample_move(temperature, rng)).expect("探索結果は合法手");
+    }
+    board.result()
+}
